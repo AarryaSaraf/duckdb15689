@@ -179,7 +179,7 @@ RelationStats RelationStatisticsHelper::ExtractDelimGetStats(LogicalDelimGet &de
 RelationStats RelationStatisticsHelper::ExtractProjectionStats(LogicalProjection &proj, RelationStats &child_stats) {
 	auto proj_stats = RelationStats();
 	proj_stats.cardinality = child_stats.cardinality;
-	proj_stats.table_name = proj.GetName();
+	proj_stats.table_name = child_stats.table_name.empty() ? proj.GetName() : child_stats.table_name;
 	for (auto &expr : proj.expressions) {
 		proj_stats.column_names.push_back(expr->GetName());
 		auto res = GetChildColumnBinding(*expr);
@@ -236,7 +236,12 @@ RelationStats RelationStatisticsHelper::CombineStatsOfReorderableOperator(vector
 			stats.column_distinct_count.push_back(child_stats.column_distinct_count.at(i));
 			stats.column_names.push_back(child_stats.column_names.at(i));
 		}
-		stats.table_name += "joined with " + child_stats.table_name;
+		if (!child_stats.table_name.empty()) {
+			if (!stats.table_name.empty()) {
+				stats.table_name += ", ";
+			}
+			stats.table_name += child_stats.table_name;
+		}
 		max_card = MaxValue(max_card, child_stats.cardinality);
 	}
 	stats.stats_initialized = true;
@@ -305,10 +310,12 @@ RelationStats RelationStatisticsHelper::CombineStatsOfNonReorderableOperator(Log
 	ret.filter_strength = 1;
 	ret.table_name = string();
 	for (auto &stats : child_stats) {
-		if (!ret.table_name.empty()) {
-			ret.table_name += " joined with ";
+		if (!stats.table_name.empty()) {
+			if (!ret.table_name.empty()) {
+				ret.table_name += ", ";
+			}
+			ret.table_name += stats.table_name;
 		}
-		ret.table_name += stats.table_name;
 		// MARK joins are nonreorderable. They won't return initialized stats
 		// continue in this case.
 		if (!stats.stats_initialized) {
@@ -343,6 +350,7 @@ RelationStats RelationStatisticsHelper::ExtractWindowStats(LogicalWindow &window
 	stats.cardinality = child_stats.cardinality;
 	stats.column_distinct_count = child_stats.column_distinct_count;
 	stats.column_names = child_stats.column_names;
+	stats.table_name = child_stats.table_name.empty() ? window.GetName() : child_stats.table_name;
 	stats.stats_initialized = true;
 	auto num_child_columns = window.GetColumnBindings().size();
 
@@ -414,6 +422,7 @@ RelationStats RelationStatisticsHelper::ExtractAggregationStats(LogicalAggregate
 	// an ungrouped aggregate has 1 row
 	stats.cardinality = aggr.groups.empty() ? 1 : LossyNumericCast<idx_t>(new_card);
 	stats.column_names = child_stats.column_names;
+	stats.table_name = child_stats.table_name.empty() ? aggr.GetName() : child_stats.table_name;
 	stats.stats_initialized = true;
 	const auto aggr_column_bindings = aggr.GetColumnBindings();
 	auto num_child_columns = aggr_column_bindings.size();

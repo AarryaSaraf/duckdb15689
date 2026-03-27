@@ -10,6 +10,15 @@
 #include "duckdb/storage/data_table.hpp"
 
 #include <math.h>
+#include <iostream>
+#include <fstream>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
+using QueryStatsMap = std::unordered_map<std::string, long>;
+const std::string ACTUAL_CARDINALITY_FILE_PATH = "/Users/Aarry/Desktop/15689/duckdb15689/actual_cardinality.json";
+const std::string ESTIMATED_CARDINALITY_FILE_PATH = "/Users/Aarry/Desktop/15689/duckdb15689/cardinality_log.txt";
+
 
 namespace duckdb {
 
@@ -20,6 +29,33 @@ bool CardinalityEstimator::EmptyFilter(FilterInfo &filter_info) {
 		return true;
 	}
 	return false;
+}
+
+unordered_map<string, double> load_cardinality_data() {
+    unordered_map<string, double> cardinality_map;
+
+    // 1. Check if the file actually exists at that path
+    std::ifstream file(ACTUAL_CARDINALITY_FILE_PATH);
+    if (!file.is_open()) {
+        std::cerr << "Error: File not found at " << ACTUAL_CARDINALITY_FILE_PATH << std::endl;
+        return cardinality_map;
+    }
+
+    try {
+        json j;
+        file >> j;
+
+        // 2. Load into the map
+        cardinality_map = j.get<unordered_map<string, double>>();
+        
+        std::cout << "Successfully loaded " << cardinality_map.size() << " entries from JSON." << std::endl;
+    } catch (const json::parse_error& e) {
+        std::cerr << "JSON Parse Error: " << e.what() << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Standard Exception: " << e.what() << std::endl;
+    }
+
+    return cardinality_map;
 }
 
 void CardinalityEstimator::AddRelationStats(FilterInfo &filter_info) {
@@ -420,7 +456,49 @@ double CardinalityEstimator::EstimateCardinalityWithSet(JoinRelationSet &new_set
 	auto numerator = GetNumerator(denom.numerator_relations);
 
 	double result = numerator / denom.denominator;
+
+	string tables_str = "";
+	vector<string> joined_tables;
+	for (idx_t i = 0; i < new_set.count; i++) {
+		auto &single_node_set = set_manager.GetJoinRelation(new_set.relations[i]);
+		auto &base_helper = relation_set_2_cardinality[single_node_set.ToString()];
+		if (!base_helper.table_names_joined.empty()) {
+			joined_tables.push_back(base_helper.table_names_joined[0]);
+			if (!tables_str.empty()) tables_str += ", ";
+			tables_str += base_helper.table_names_joined[0];
+		}
+	}
+
+	string filter_str = "";
+	auto edges = GetEdges(relation_set_stats, new_set);
+	for (auto &edge : edges) {
+		if (edge.filter_info && edge.filter_info->filter) {
+			if (!filter_str.empty()) filter_str += " AND ";
+			filter_str += edge.filter_info->filter->ToString();
+		}
+	}
+
+	string logical_join = "LOGICAL_JOIN: RelSets: " + new_set.ToString() + " Tables: [" + tables_str + "] Filters: [" + filter_str + "]";
+
+
+	static auto observed_cardinalities = load_cardinality_data();
+
+	std::ofstream log_file(ESTIMATED_CARDINALITY_FILE_PATH, std::ios_base::app);
+	if (observed_cardinalities.find(logical_join) != observed_cardinalities.end()) {
+		result = observed_cardinalities[logical_join];
+		if (log_file.is_open()) {
+			log_file << logical_join << " using INJECTED Cardinality: " << to_string(result) << std::endl;
+		}
+	} else {
+		if (log_file.is_open()) {
+			log_file << logical_join << " Estimated Cardinality: " << to_string(result) << std::endl;
+		}
+	}
+	log_file.close();
+
 	auto new_entry = CardinalityHelper(result);
+	new_entry.table_names_joined = joined_tables;
+
 	relation_set_2_cardinality[new_set.ToString()] = new_entry;
 	return result;
 }
@@ -454,6 +532,7 @@ void CardinalityEstimator::InitCardinalityEstimatorProps(optional_ptr<JoinRelati
 	auto relation_cardinality = stats.cardinality;
 
 	auto card_helper = CardinalityHelper((double)relation_cardinality);
+	card_helper.table_names_joined.push_back(stats.table_name);
 	relation_set_2_cardinality[set->ToString()] = card_helper;
 
 	UpdateTotalDomains(set, stats);

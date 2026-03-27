@@ -24,6 +24,23 @@ project(DuckDB)
 
 find_package(Threads REQUIRED)
 
+# macOS + LLVM Clang: CMake{C,CXX}Compiler.cmake sets CMAKE_AR to /usr/bin/ar while
+# CMAKE_*_COMPILER_AR is llvm-ar; cache-only -DCMAKE_AR=... does not fix link.txt. Override the
+# normal variables after project() so static library rules use matching ar + ranlib.
+if(APPLE)
+  if(CMAKE_CXX_COMPILER_AR AND EXISTS "${CMAKE_CXX_COMPILER_AR}")
+    set(CMAKE_AR "${CMAKE_CXX_COMPILER_AR}")
+    if(CMAKE_CXX_COMPILER_RANLIB AND EXISTS "${CMAKE_CXX_COMPILER_RANLIB}")
+      set(CMAKE_RANLIB "${CMAKE_CXX_COMPILER_RANLIB}")
+    endif()
+  elseif(CMAKE_C_COMPILER_AR AND EXISTS "${CMAKE_C_COMPILER_AR}")
+    set(CMAKE_AR "${CMAKE_C_COMPILER_AR}")
+    if(CMAKE_C_COMPILER_RANLIB AND EXISTS "${CMAKE_C_COMPILER_RANLIB}")
+      set(CMAKE_RANLIB "${CMAKE_C_COMPILER_RANLIB}")
+    endif()
+  endif()
+endif()
+
 set(DUCKDB_MODULE_BASE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
