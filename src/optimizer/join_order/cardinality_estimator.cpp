@@ -12,15 +12,48 @@
 #include <math.h>
 #include <iostream>
 #include <fstream>
+#include <algorithm>
+#include <cstdlib>
+#include <unordered_map>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
 using QueryStatsMap = std::unordered_map<std::string, long>;
-const std::string ACTUAL_CARDINALITY_FILE_PATH = "/Users/Aarry/Desktop/15689/duckdb15689/actual_cardinality.json";
-const std::string ESTIMATED_CARDINALITY_FILE_PATH = "/Users/Aarry/Desktop/15689/duckdb15689/cardinality_log.txt";
-
+const std::string DEFAULT_ACTUAL_CARDINALITY_FILE_PATH = "/Users/Aarry/Desktop/15689/duckdb15689/actual_cardinality.json";
+const std::string DEFAULT_ESTIMATED_CARDINALITY_FILE_PATH = "/Users/Aarry/Desktop/15689/duckdb15689/cardinality_log.txt";
+const char *ACTUAL_CARDINALITY_ENV_VAR = "DUCKDB_ACTUAL_CARDINALITY_JSON";
+const char *ESTIMATED_CARDINALITY_ENV_VAR = "DUCKDB_CARDINALITY_LOG";
+const char *PLAN_FINGERPRINT_ENV_VAR = "DUCKDB_FEEDBACK_PLAN_FINGERPRINT";
 
 namespace duckdb {
+
+static string GetPathFromEnvOrDefault(const char *env_var_name, const string &default_path) {
+	const char *env_value = std::getenv(env_var_name);
+	if (env_value && env_value[0] != '\0') {
+		return string(env_value);
+	}
+	return default_path;
+}
+
+static string EscapeRelBindingToken(const string &input) {
+	string escaped;
+	escaped.reserve(input.size() + 8);
+	for (auto ch : input) {
+		if (ch == '\\' || ch == '|') {
+			escaped += '\\';
+		}
+		escaped += ch;
+	}
+	return escaped;
+}
+
+static string MakeCardinalityLookupKey(const string &logical_join) {
+	const char *plan_fp = std::getenv(PLAN_FINGERPRINT_ENV_VAR);
+	if (plan_fp && plan_fp[0] != '\0') {
+		return "PLANFP:" + string(plan_fp) + "::" + logical_join;
+	}
+	return logical_join;
+}
 
 // The filter was made on top of a logical sample or other projection,
 // but no specific columns are referenced. See issue 4978 number 4.
@@ -33,11 +66,13 @@ bool CardinalityEstimator::EmptyFilter(FilterInfo &filter_info) {
 
 unordered_map<string, double> load_cardinality_data() {
     unordered_map<string, double> cardinality_map;
+    auto actual_cardinality_path =
+        GetPathFromEnvOrDefault(ACTUAL_CARDINALITY_ENV_VAR, DEFAULT_ACTUAL_CARDINALITY_FILE_PATH);
 
     // 1. Check if the file actually exists at that path
-    std::ifstream file(ACTUAL_CARDINALITY_FILE_PATH);
+    std::ifstream file(actual_cardinality_path);
     if (!file.is_open()) {
-        std::cerr << "Error: File not found at " << ACTUAL_CARDINALITY_FILE_PATH << std::endl;
+        std::cerr << "Error: File not found at " << actual_cardinality_path << std::endl;
         return cardinality_map;
     }
 
@@ -86,6 +121,12 @@ bool CardinalityEstimator::SingleColumnFilter(duckdb::FilterInfo &filter_info) {
 		return false;
 	}
 	return true;
+}
+
+void CardinalityEstimator::SetPendingParentSplit(optional_ptr<JoinRelationSet> left_set,
+                                                 optional_ptr<JoinRelationSet> right_set) {
+	pending_left_split = left_set;
+	pending_right_split = right_set;
 }
 
 vector<idx_t> CardinalityEstimator::DetermineMatchingEquivalentSets(optional_ptr<FilterInfo> filter_info) {
@@ -457,35 +498,102 @@ double CardinalityEstimator::EstimateCardinalityWithSet(JoinRelationSet &new_set
 
 	double result = numerator / denom.denominator;
 
-	string tables_str = "";
+	string rel_bindings_str = "";
+	string input_cards_str = "";
 	vector<string> joined_tables;
 	for (idx_t i = 0; i < new_set.count; i++) {
-		auto &single_node_set = set_manager.GetJoinRelation(new_set.relations[i]);
+		auto relation_index = new_set.relations[i];
+		auto &single_node_set = set_manager.GetJoinRelation(relation_index);
 		auto &base_helper = relation_set_2_cardinality[single_node_set.ToString()];
+		string base_table_name = "[unknown]";
 		if (!base_helper.table_names_joined.empty()) {
-			joined_tables.push_back(base_helper.table_names_joined[0]);
-			if (!tables_str.empty()) tables_str += ", ";
-			tables_str += base_helper.table_names_joined[0];
+			base_table_name = base_helper.table_names_joined[0];
 		}
+		joined_tables.push_back(base_table_name);
+		if (!rel_bindings_str.empty()) {
+			rel_bindings_str += " | ";
+		}
+		rel_bindings_str += to_string(relation_index) + ":" + EscapeRelBindingToken(base_table_name);
+		if (!input_cards_str.empty()) {
+			input_cards_str += " | ";
+		}
+		auto input_cardinality = static_cast<long long>(llround(base_helper.cardinality_before_filters));
+		input_cards_str += to_string(relation_index) + ":" + to_string(input_cardinality);
 	}
 
-	string filter_str = "";
+	vector<string> filter_terms;
+	vector<string> edge_sig_terms;
 	auto edges = GetEdges(relation_set_stats, new_set);
 	for (auto &edge : edges) {
 		if (edge.filter_info && edge.filter_info->filter) {
-			if (!filter_str.empty()) filter_str += " AND ";
-			filter_str += edge.filter_info->filter->ToString();
+			filter_terms.push_back(edge.filter_info->filter->ToString());
+			auto &fi = *edge.filter_info;
+			string edge_sig = "jt=" + to_string(static_cast<int>(fi.join_type)) +
+			                  ",res=" + string(fi.from_residual_predicate ? "1" : "0") +
+			                  ",li=" + to_string(fi.left_binding.table_index) + ":" +
+			                  to_string(fi.left_binding.column_index) +
+			                  ",ri=" + to_string(fi.right_binding.table_index) + ":" +
+			                  to_string(fi.right_binding.column_index) + ",fi=" + to_string(fi.filter_index);
+			edge_sig_terms.push_back(edge_sig);
 		}
 	}
+	std::sort(filter_terms.begin(), filter_terms.end());
+	std::sort(edge_sig_terms.begin(), edge_sig_terms.end());
+	string filter_str = "";
+	for (idx_t i = 0; i < filter_terms.size(); i++) {
+		if (!filter_str.empty()) {
+			filter_str += " AND ";
+		}
+		filter_str += filter_terms[i];
+	}
+	string edge_sig_str = "";
+	for (idx_t i = 0; i < edge_sig_terms.size(); i++) {
+		if (!edge_sig_str.empty()) {
+			edge_sig_str += " | ";
+		}
+		edge_sig_str += edge_sig_terms[i];
+	}
+	string numerator_relset_str = denom.numerator_relations.ToString();
+	string parent_split_str = "[none]";
+	if (pending_left_split && pending_right_split) {
+		string left_split = pending_left_split->ToString();
+		string right_split = pending_right_split->ToString();
+		if (right_split < left_split) {
+			std::swap(left_split, right_split);
+		}
+		parent_split_str = "[" + left_split + " | " + right_split + "]";
+	}
 
-	string logical_join = "LOGICAL_JOIN: RelSets: " + new_set.ToString() + " Tables: [" + tables_str + "] Filters: [" + filter_str + "]";
-
-
+	string logical_join_core = "LOGICAL_JOIN: RelSets: " + new_set.ToString() + " RelBindings: [" + rel_bindings_str +
+	                           "] NumRels: " + numerator_relset_str + " CtxInputCards: [" + input_cards_str + "]" +
+	                           " CtxParentSplit: " + parent_split_str + " CtxEdgeSig: [" + edge_sig_str + "]" +
+	                           " Filters: [" + filter_str + "]";
+	// Per-run occurrence index disambiguates repeated identical join keys so we only
+	// inject a value back into the exact same key-context position.
+	static unordered_map<string, idx_t> logical_join_occurrence_counter;
+	auto occ_it = logical_join_occurrence_counter.find(logical_join_core);
+	idx_t occurrence = 1;
+	if (occ_it == logical_join_occurrence_counter.end()) {
+		logical_join_occurrence_counter[logical_join_core] = 2;
+	} else {
+		occurrence = occ_it->second;
+		occ_it->second += 1;
+	}
+	string logical_join = logical_join_core + " CtxOcc: " + to_string(occurrence);
 	static auto observed_cardinalities = load_cardinality_data();
+	string lookup_key = MakeCardinalityLookupKey(logical_join);
+	auto observed_it = observed_cardinalities.find(lookup_key);
+	// Backward-compatible fallback for legacy unnamespaced JSON keys.
+	if (observed_it == observed_cardinalities.end() && lookup_key != logical_join) {
+		observed_it = observed_cardinalities.find(logical_join);
+	}
+	bool has_injected = observed_it != observed_cardinalities.end();
 
-	std::ofstream log_file(ESTIMATED_CARDINALITY_FILE_PATH, std::ios_base::app);
-	if (observed_cardinalities.find(logical_join) != observed_cardinalities.end()) {
-		result = observed_cardinalities[logical_join];
+	auto estimated_cardinality_log_path =
+	    GetPathFromEnvOrDefault(ESTIMATED_CARDINALITY_ENV_VAR, DEFAULT_ESTIMATED_CARDINALITY_FILE_PATH);
+	std::ofstream log_file(estimated_cardinality_log_path, std::ios_base::app);
+	if (has_injected) {
+		result = observed_it->second;
 		if (log_file.is_open()) {
 			log_file << logical_join << " using INJECTED Cardinality: " << to_string(result) << std::endl;
 		}

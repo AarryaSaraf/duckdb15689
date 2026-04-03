@@ -90,7 +90,7 @@ public:
 class CardinalityEstimator {
 public:
 	static constexpr double DEFAULT_SEMI_ANTI_SELECTIVITY = 5;
-	explicit CardinalityEstimator() {};
+	explicit CardinalityEstimator() : pending_left_split(nullptr), pending_right_split(nullptr) {};
 
 private:
 	vector<RelationsSetToStats> relation_set_stats;
@@ -102,6 +102,7 @@ public:
 	void RemoveEmptyTotalDomains();
 	void UpdateTotalDomains(optional_ptr<JoinRelationSet> set, RelationStats &stats);
 	void InitEquivalentRelations(const vector<unique_ptr<FilterInfo>> &filter_infos);
+	void SetPendingParentSplit(optional_ptr<JoinRelationSet> left_set, optional_ptr<JoinRelationSet> right_set);
 
 	void InitCardinalityEstimatorProps(optional_ptr<JoinRelationSet> set, RelationStats &stats);
 
@@ -117,6 +118,8 @@ public:
 private:
 	double GetNumerator(JoinRelationSet &set);
 	DenomInfo GetDenominator(JoinRelationSet &set);
+	optional_ptr<JoinRelationSet> pending_left_split;
+	optional_ptr<JoinRelationSet> pending_right_split;
 
 	bool SingleColumnFilter(FilterInfo &filter_info);
 	vector<idx_t> DetermineMatchingEquivalentSets(optional_ptr<FilterInfo> filter_info);
