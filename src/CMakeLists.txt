@@ -89,6 +89,16 @@ foreach(LINK_LIB ${DUCKDB_LINK_LIBS})
   list(APPEND LINK_OBJECTS $<TARGET_OBJECTS:${LINK_LIB}>)
 endforeach(LINK_LIB)
 
+if(BUILD_FEEDBACK_LEGACY_SHELL)
+  string(
+    REPLACE "$<TARGET_OBJECTS:duckdb_optimizer_join_order>"
+            "$<TARGET_OBJECTS:duckdb_optimizer_join_order_feedback>" ALL_OBJECT_FILES_FEEDBACK
+            "${ALL_OBJECT_FILES}")
+  add_library(duckdb_static_feedback STATIC ${ALL_OBJECT_FILES_FEEDBACK} ${LINK_OBJECTS})
+  target_link_libraries(duckdb_static_feedback PUBLIC ${DUCKDB_SYSTEM_LIBS})
+  link_threads(duckdb_static_feedback PUBLIC)
+endif()
+
 add_library(duckdb_static STATIC ${ALL_OBJECT_FILES} ${LINK_OBJECTS})
 target_link_libraries(duckdb_static PUBLIC ${DUCKDB_SYSTEM_LIBS})
 link_threads(duckdb_static PUBLIC)

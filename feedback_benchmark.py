@@ -5,32 +5,42 @@ Iteratively runs TPC-DS queries, captures actual join cardinalities from
 the physical plan, injects them back into the optimizer via actual_cardinality.json,
 and repeats until the physical plan converges (stops changing).
 
-Uses JSON profiling to get structured plan output.
+Query SQL is loaded from ``feedback_queries/tpcds/qNN.sql`` (see ``feedback_queries/README.md``).
+Uses JSON profiling for structured plan trees.
+
+Environment:
+  DUCKDB_FEEDBACK_DB, DUCKDB_FEEDBACK_SF — database path and label for the banner
+  DUCKDB_FEEDBACK_MAX_QUERIES — if set, only Q1..QN run (smoke tests)
 """
 
+import ast
+import hashlib
+import json
 import os
 import re
 import subprocess
-import json
-import sys
-import ast
-import time
-import hashlib
 from collections import Counter
 
-# ============================================================================
-# CONSTANTS
-# ============================================================================
+# --- Repo paths ---
+REPO_ROOT = os.path.abspath(os.path.dirname(__file__))
+DUCKDB_BIN = os.path.join(REPO_ROOT, "build/release/duckdb")
+CARDINALITY_LOG = os.path.join(REPO_ROOT, "cardinality_log.txt")
+ACTUAL_CARDINALITY_JSON = os.path.join(REPO_ROOT, "actual_cardinality.json")
+PROFILE_OUTPUT = os.path.join(REPO_ROOT, "profile_output.json")
+TPCDS_QUERY_DIR = os.path.join(REPO_ROOT, "feedback_queries", "tpcds")
 
-DUCKDB_DIR = "/Users/Aarry/Desktop/15689/duckdb15689/"
+# --- Run configuration ---
+DB_FILE = os.environ.get("DUCKDB_FEEDBACK_DB", "/Users/Aarry/Desktop/15689/tpcds_sf200.db").strip()
+SCALE_FACTOR = int(os.environ.get("DUCKDB_FEEDBACK_SF", "200"))
+TARGET_QUERIES = list(range(1, 100))
+_MQQ = os.environ.get("DUCKDB_FEEDBACK_MAX_QUERIES")
+if _MQQ:
+    _nq = max(1, min(99, int(_MQQ.strip())))
+    TARGET_QUERIES = list(range(1, _nq + 1))
+MAX_ITERATIONS = 20
+MAIN_QUERY_TIMEOUT_SEC = int(os.getenv("DUCKDB_BENCHMARK_MAIN_QUERY_TIMEOUT_SEC", "600"))
 
-# Directory containing this file (NDJSON logs go here so they stay with the repo).
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# When True: append NDJSON to .cursor/debug-03a206.log and injection_debug.ndjson
-# (next to this script), and run batch-collision analysis in update_actual_cardinality_json.
-# When False, skip NDJSON only. Plan-stable [INFO]/[ALARM] for JSON updates is always on.
-DEBUG_FEEDBACK_BENCHMARK = True
+# --- Matching / JSON drift thresholds ---
 STABLE_PLAN_ABS_DRIFT_TOLERANCE = 100
 STABLE_PLAN_REL_DRIFT_TOLERANCE = 0.001  # 0.1%
 LARGE_DELTA_ABS_THRESHOLD = 100000
@@ -38,79 +48,28 @@ LARGE_DELTA_REL_THRESHOLD = 0.50
 PLAN_FINGERPRINT_ENV_VAR = "DUCKDB_FEEDBACK_PLAN_FINGERPRINT"
 PLAN_KEY_PREFIX = "PLANFP:"
 
-# #region agent log
-_AGENT_DEBUG_LOG = os.path.join(_SCRIPT_DIR, ".cursor", "debug-03a206.log")
-_AGENT_DEBUG_MIRROR = os.path.join(_SCRIPT_DIR, "injection_debug.ndjson")
+JOIN_OPERATOR_NAMES = {
+    "HASH_JOIN",
+    "NESTED_LOOP_JOIN",
+    "PIECEWISE_MERGE_JOIN",
+    "CROSS_PRODUCT",
+    "POSITIONAL_JOIN",
+    "BLOCKWISE_NL_JOIN",
+    "IE_JOIN",
+    "ASOF_JOIN",
+    "DELIM_JOIN",
+    "LEFT_DELIM_JOIN",
+    "RIGHT_DELIM_JOIN",
+}
 
 
-def _agent_debug_ndjson(hypothesis_id, location, message, data, run_id="unknown"):
-    """Append one NDJSON line for Q23 / injection debugging (no side effects)."""
-    if not DEBUG_FEEDBACK_BENCHMARK:
-        return
-    line = (
-        json.dumps(
-            {
-                "sessionId": "03a206",
-                "hypothesisId": hypothesis_id,
-                "runId": run_id,
-                "location": location,
-                "message": message,
-                "data": data,
-                "timestamp": int(time.time() * 1000),
-            },
-            separators=(",", ":"),
-        )
-        + "\n"
-    )
-    for path in (_AGENT_DEBUG_LOG, _AGENT_DEBUG_MIRROR):
-        try:
-            d = os.path.dirname(path)
-            if d:
-                os.makedirs(d, exist_ok=True)
-            with open(path, "a") as f:
-                f.write(line)
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except Exception:
-                    pass
-        except Exception as e:
-            try:
-                sys.stderr.write(
-                    f"[injection-debug] NDJSON write failed path={path!r} err={e!r}\n"
-                )
-            except Exception:
-                pass
-
-
-# #endregion
-DUCKDB_BIN = os.path.join(DUCKDB_DIR, "build/release/duckdb")
-CARDINALITY_LOG = os.path.join(DUCKDB_DIR, "cardinality_log.txt")
-ACTUAL_CARDINALITY_JSON = os.path.join(DUCKDB_DIR, "actual_cardinality.json")
-PROFILE_OUTPUT = os.path.join(DUCKDB_DIR, "profile_output.json")
-
-DB_FILE = "/Users/Aarry/Desktop/15689/tpcds_sf200.db"
-SCALE_FACTOR = 200
-
-TARGET_QUERIES = [85]
-# TARGET_QUERIES = [44, 64, 74, 84, 85]
-# TARGET_QUERIES = [7, 10]
-MAX_ITERATIONS = 20                 # safety cap per query
-
-PYTHON_BIN = "/usr/local/bin/python3"
-
-# Operators in the physical plan that represent joins
-JOIN_OPERATOR_NAMES = {"HASH_JOIN", "NESTED_LOOP_JOIN", "PIECEWISE_MERGE_JOIN",
-                       "CROSS_PRODUCT", "POSITIONAL_JOIN", "BLOCKWISE_NL_JOIN",
-                       "IE_JOIN", "ASOF_JOIN", "DELIM_JOIN",
-                       "LEFT_DELIM_JOIN", "RIGHT_DELIM_JOIN"}
-
-
-def _base_table_name(table_path):
+def base_table_name(table_path):
+    """Last component of a qualified table name (schema.table -> table)."""
     return str(table_path).split(".")[-1]
 
 
 def compute_plan_fingerprint(plan_text):
+    """Short hash of plan structure text (for stable-plan checks and namespaced keys)."""
     return hashlib.sha1(plan_text.encode("utf-8")).hexdigest()[:12]
 
 
@@ -153,7 +112,7 @@ def _collect_tables_with_cte(node, cte_lineage):
     extra = node.get("extra_info", {})
 
     if op_name == "SEQ_SCAN" and "Table" in extra:
-        tables.add(_base_table_name(extra["Table"]))
+        tables.add(base_table_name(extra["Table"]))
     elif op_name == "CTE_SCAN":
         cte_idx = str(extra.get("CTE Index", "")).strip()
         if cte_idx and cte_idx in cte_lineage and cte_lineage[cte_idx]:
@@ -202,37 +161,23 @@ def build_cte_lineage(root):
 
 
 # ============================================================================
-# QUERY EXTRACTION
+# TPC-DS QUERY FILES (feedback_queries/tpcds/qNN.sql)
 # ============================================================================
 
-def extract_tpcds_queries(query_nrs):
-    """
-    Uses the Python duckdb package to extract TPC-DS query SQL text
-    for the given query numbers. Returns a dict {query_nr: sql_string}.
-    """
-    code = f"""
-import duckdb, json
-con = duckdb.connect(':memory:')
-con.execute('INSTALL tpcds; LOAD tpcds')
-rows = con.execute('SELECT query_nr, query FROM tpcds_queries()').fetchall()
-result = {{}}
-for nr, sql in rows:
-    if nr in {query_nrs}:
-        result[nr] = sql
-print(json.dumps(result))
-"""
-    proc = subprocess.run(
-        [PYTHON_BIN, "-c", code],
-        capture_output=True, text=True
-    )
-    assert proc.returncode == 0, f"Failed to extract queries: {proc.stderr}"
 
-    lines = [line for line in proc.stdout.splitlines() if line.strip().startswith("{")]
-    assert len(lines) > 0, "No JSON output from query extraction"
-
-    raw = json.loads(lines[-1])
-    # Keys come back as strings; convert to int
-    return {int(k): v for k, v in raw.items()}
+def load_tpcds_queries(query_nrs):
+    """
+    Load SQL for each query number from ``feedback_queries/tpcds/q01.sql`` … ``q99.sql``.
+    Missing files are skipped (caller may treat as absent query).
+    """
+    out = {}
+    for nr in query_nrs:
+        path = os.path.join(TPCDS_QUERY_DIR, f"q{nr:02d}.sql")
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as f:
+            out[nr] = f.read().strip() + "\n"
+    return out
 
 
 # ============================================================================
@@ -302,30 +247,24 @@ def purge_unsafe_expressions_from_json(unsafe_expressions, *, query_nr=None, ite
         f"    [QUARANTINE-DELETE] Removed {len(keys_to_delete)} unsafe key(s) "
         f"from actual_cardinality.json."
     )
-    # #region agent log
-    if DEBUG_FEEDBACK_BENCHMARK:
-        _agent_debug_ndjson(
-            "H-R5-quarantine-delete",
-            "purge_unsafe_expressions_from_json",
-            "removed unsafe keys from JSON quarantine",
-            {
-                "query_nr": query_nr,
-                "iteration": iteration,
-                "n_removed_keys": len(keys_to_delete),
-                "removed_keys_sample": [
-                    (k[-220:] if len(k) > 220 else k) for k in keys_to_delete[:10]
-                ],
-                "n_unsafe_expressions": len(unsafe_expressions),
-            },
-            run_id="post-fix",
-        )
-    # #endregion
     return len(keys_to_delete)
 
 
 # ============================================================================
 # QUERY EXECUTION
 # ============================================================================
+
+def child_duckdb_env(base_env=None):
+    """
+    Environment passed to the DuckDB subprocess. Must set DUCKDB_ACTUAL_CARDINALITY_JSON
+    and DUCKDB_CARDINALITY_LOG so the forked binary reads/writes the same paths as this
+    script (the C++ defaults point elsewhere).
+    """
+    env = (base_env if base_env is not None else os.environ).copy()
+    env["DUCKDB_ACTUAL_CARDINALITY_JSON"] = ACTUAL_CARDINALITY_JSON
+    env["DUCKDB_CARDINALITY_LOG"] = CARDINALITY_LOG
+    return env
+
 
 def run_query_with_json_profile(query_sql, plan_fingerprint_hint=None):
     """
@@ -349,39 +288,16 @@ def run_query_with_json_profile(query_sql, plan_fingerprint_hint=None):
         run_env[PLAN_FINGERPRINT_ENV_VAR] = plan_fingerprint_hint
     else:
         run_env.pop(PLAN_FINGERPRINT_ENV_VAR, None)
-    # #region agent log
-    if DEBUG_FEEDBACK_BENCHMARK:
-        try:
-            duckdb_realpath = os.path.realpath(DUCKDB_BIN)
-            duckdb_stat = os.stat(DUCKDB_BIN)
-            _agent_debug_ndjson(
-                "H-runtime-binary",
-                "run_query_with_json_profile",
-                "duckdb binary identity before execution",
-                {
-                    "duckdb_bin": DUCKDB_BIN,
-                    "duckdb_realpath": duckdb_realpath,
-                    "duckdb_exists": os.path.exists(DUCKDB_BIN),
-                    "duckdb_size": int(duckdb_stat.st_size),
-                    "duckdb_mtime": int(duckdb_stat.st_mtime),
-                    "profile_output": PROFILE_OUTPUT,
-                },
-                run_id="pre-fix",
-            )
-        except Exception as e:
-            _agent_debug_ndjson(
-                "H-runtime-binary",
-                "run_query_with_json_profile",
-                "failed to stat duckdb binary",
-                {"duckdb_bin": DUCKDB_BIN, "error": str(e)},
-                run_id="pre-fix",
-            )
-    # #endregion
+    run_env = child_duckdb_env(run_env)
 
-    proc = subprocess.run(
-        [DUCKDB_BIN, DB_FILE, "-c", full_sql],
-        capture_output=True, text=True, env=run_env
-    )
+    try:
+        proc = subprocess.run(
+            [DUCKDB_BIN, DB_FILE, "-c", full_sql],
+            capture_output=True, text=True, env=run_env, timeout=MAIN_QUERY_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  [ERROR] Profile run TIMEOUT after {MAIN_QUERY_TIMEOUT_SEC}s")
+        return None
 
     if proc.returncode != 0:
         print(f"  [ERROR] DuckDB returned non-zero: {proc.stderr[:500]}")
@@ -427,7 +343,7 @@ def _collect_subtree_scan_signatures(node):
     op_name = node.get("operator_name", node.get("name", ""))
     extra = node.get("extra_info", {}) or {}
     if op_name == "SEQ_SCAN":
-        table = _base_table_name(str(extra.get("Table", "")))
+        table = base_table_name(str(extra.get("Table", "")))
         filters = str(extra.get("Filters", ""))
         projections = str(extra.get("Projections", ""))
         out.append(f"SEQ_SCAN table={table} filters={filters} projections={projections}")
@@ -638,31 +554,6 @@ def parse_cardinality_log():
                 })
                 if table_name:
                     tables.append(table_name)
-            # #region agent log
-            if DEBUG_FEEDBACK_BENCHMARK:
-                relsets_match = re.search(r"RelSets: \[(.*?)\]", expression)
-                relset_count = None
-                if relsets_match:
-                    relset_count = len([x.strip() for x in relsets_match.group(1).split(",") if x.strip()])
-                parsed_with_colon = sum(
-                    1 for rb in rel_bindings if rb["relation_index"] is not None
-                )
-                malformed_tokens = [rb["raw"] for rb in rel_bindings if rb["relation_index"] is None]
-                if relset_count is not None and relset_count != parsed_with_colon:
-                    _agent_debug_ndjson(
-                        "H-relbindings-parse",
-                        "parse_cardinality_log",
-                        "RelBindings parse count mismatch vs RelSets",
-                        {
-                            "expression_tail": expression[-220:] if len(expression) > 220 else expression,
-                            "relsets_count": relset_count,
-                            "parsed_with_colon_count": parsed_with_colon,
-                            "raw_relbindings": rel_bindings_raw,
-                            "malformed_tokens_sample": malformed_tokens[:6],
-                        },
-                        run_id="pre-fix",
-                    )
-            # #endregion
         else:
             tables_match = re.search(r"Tables: \[(.*?)\]", expression)
             if tables_match:
@@ -686,67 +577,6 @@ def parse_cardinality_log():
             "is_injected": is_injected,
         })
 
-    # #region agent log
-    if DEBUG_FEEDBACK_BENCHMARK:
-        _agent_debug_ndjson(
-            "H-ctx-presence",
-            "parse_cardinality_log",
-            "raw logical join context token presence summary",
-            {
-                "cardinality_log_path": CARDINALITY_LOG,
-                "logical_join_line_count": logical_join_line_count,
-                "ctx_input_raw_count": ctx_input_raw_count,
-                "ctx_input_missing_count": logical_join_line_count - ctx_input_raw_count,
-                "sample_expression_without_ctx_tail": sample_without_ctx,
-            },
-            run_id="pre-fix",
-        )
-        # #region agent log
-        full_expr_cards = {}
-        core_expr_cards = {}
-        core_expr_ctx_occ = {}
-        for e in entries:
-            expr = e.get("expression", "")
-            card = int(e.get("cardinality", 0))
-            core_expr = re.sub(r" CtxOcc: \d+$", "", expr)
-            occ_match = re.search(r"CtxOcc: (\d+)$", expr)
-            ctx_occ = int(occ_match.group(1)) if occ_match else None
-            full_expr_cards.setdefault(expr, set()).add(card)
-            core_expr_cards.setdefault(core_expr, set()).add(card)
-            core_expr_ctx_occ.setdefault(core_expr, set()).add(ctx_occ)
-        full_expr_conflicts = [
-            {
-                "expr_tail": k[-220:] if len(k) > 220 else k,
-                "cards": sorted(list(v)),
-            }
-            for k, v in full_expr_cards.items()
-            if len(v) > 1
-        ]
-        core_expr_conflicts = [
-            {
-                "core_expr_tail": k[-220:] if len(k) > 220 else k,
-                "cards": sorted(list(v)),
-                "ctx_occ_values": sorted(
-                    [x for x in core_expr_ctx_occ.get(k, set()) if x is not None]
-                ),
-            }
-            for k, v in core_expr_cards.items()
-            if len(v) > 1
-        ]
-        _agent_debug_ndjson(
-            "H-R1-key-collision-scan",
-            "parse_cardinality_log",
-            "scan for conflicting cardinalities by full/core key",
-            {
-                "n_entries": len(entries),
-                "n_full_expr_conflicts": len(full_expr_conflicts),
-                "n_core_expr_conflicts": len(core_expr_conflicts),
-                "full_expr_conflicts_sample": full_expr_conflicts[:10],
-                "core_expr_conflicts_sample": core_expr_conflicts[:10],
-            },
-            run_id="root-cause-pre-fix",
-        )
-        # #endregion
     # #endregion
 
     return entries
@@ -874,6 +704,11 @@ def extract_dynamic_filter_columns(subtree_operator_signatures):
 
 
 def _is_tautology_condition(norm_cond):
+    """
+    Filter out empty or degenerate normalized conditions. After ``normalize_single_condition``,
+    equality becomes a 2-element frozenset; if parsing produces a 1-element frozenset, treat
+    it as non-informative and drop it from matching.
+    """
     if isinstance(norm_cond, frozenset):
         return len(norm_cond) == 1
     return False
@@ -1033,115 +868,6 @@ def match_joins(profile_joins, log_entries):
 
         if best_lidx != -1:
             used_log_indices.add(best_lidx)
-            # #region agent log
-            if DEBUG_FEEDBACK_BENCHMARK:
-                _agent_debug_ndjson(
-                    "H-match-selection",
-                    "match_joins",
-                    "selected log expression for physical join",
-                    {
-                        "profile_join_index": pidx,
-                        "selected_log_index": best_lidx,
-                        "selected_expression_tail": (
-                            log_entries[best_lidx]["expression"][-220:]
-                            if len(log_entries[best_lidx]["expression"]) > 220
-                            else log_entries[best_lidx]["expression"]
-                        ),
-                        "selected_cardinality": int(log_entries[best_lidx]["cardinality"]),
-                        "selected_is_injected": bool(log_entries[best_lidx]["is_injected"]),
-                        "profile_actual_cardinality": int(actual_card),
-                        "profile_conditions": p_conditions,
-                        "profile_descendant_tables": sorted(list(p_desc_tables)),
-                        "profile_plan_path": p_plan_path,
-                        "lineage_incomplete": p_lineage_incomplete,
-                        "candidate_count": candidate_count,
-                    },
-                    run_id="pre-fix",
-                )
-            # #endregion
-            # #region agent log
-            if DEBUG_FEEDBACK_BENCHMARK and candidate_count > 1:
-                closest_by_card = min(
-                    candidate_debug_rows,
-                    key=lambda r: (
-                        r.get("candidate_abs_delta_to_actual", float("inf")),
-                        r.get("stage", 99),
-                        r.get("table_delta", float("inf")),
-                        r.get("cond_diff", float("inf")),
-                    ),
-                )
-                distinct_relsets = sorted(
-                    {row.get("candidate_relsets") for row in candidate_debug_rows if row.get("candidate_relsets") is not None}
-                )
-                distinct_numrels = sorted(
-                    {row.get("candidate_numrels") for row in candidate_debug_rows if row.get("candidate_numrels") is not None}
-                )
-                distinct_ctx_inputs = sorted(
-                    {
-                        row.get("candidate_ctx_input_cards")
-                        for row in candidate_debug_rows
-                        if row.get("candidate_ctx_input_cards") is not None
-                    }
-                )
-                _agent_debug_ndjson(
-                    "H-ambiguous-match",
-                    "match_joins",
-                    "Multiple log candidates; selected best by tie-breakers",
-                    {
-                        "profile_join_index": pidx,
-                        "candidate_count": candidate_count,
-                        "selected_log_index": best_lidx,
-                        "selected_expression_tail": (
-                            log_entries[best_lidx]["expression"][-220:]
-                            if len(log_entries[best_lidx]["expression"]) > 220
-                            else log_entries[best_lidx]["expression"]
-                        ),
-                        "selected_stage": best_stage,
-                        "selected_table_delta": best_table_delta,
-                        "selected_cond_diff": best_cond_diff,
-                        "selected_abs_delta_to_profile_est": best_est_delta,
-                        "selected_abs_delta_to_actual": abs(
-                            int(log_entries[best_lidx]["cardinality"]) - int(actual_card)
-                        ),
-                        "closest_by_card_log_index": closest_by_card.get("log_index"),
-                        "closest_by_card_abs_delta": closest_by_card.get("candidate_abs_delta_to_actual"),
-                        "profile_operator_name": p_operator_name,
-                        "profile_join_type": p_join_type,
-                        "profile_estimated_cardinality": p_estimated_cardinality,
-                        "profile_plan_path": p_plan_path,
-                        "profile_descendant_tables": sorted(list(p_desc_tables)),
-                        "selected_log_tables": sorted(list(log_table_sets[best_lidx])),
-                        "lineage_incomplete": p_lineage_incomplete,
-                        "distinct_candidate_relsets": distinct_relsets,
-                        "distinct_candidate_numrels": distinct_numrels,
-                        "distinct_candidate_ctx_input_cards": distinct_ctx_inputs,
-                        "candidate_rows": candidate_debug_rows,
-                    },
-                    run_id="pre-fix",
-                )
-                if (
-                    closest_by_card.get("log_index") != best_lidx
-                    and abs(int(log_entries[best_lidx]["cardinality"]) - int(actual_card)) >= LARGE_DELTA_ABS_THRESHOLD
-                ):
-                    _agent_debug_ndjson(
-                        "H-ambiguous-cardinality-gap",
-                        "match_joins",
-                        "tie-breaker selected non-closest cardinality candidate with large delta",
-                        {
-                            "profile_join_index": pidx,
-                            "selected_log_index": best_lidx,
-                            "selected_abs_delta_to_actual": abs(
-                                int(log_entries[best_lidx]["cardinality"]) - int(actual_card)
-                            ),
-                            "closest_by_card_log_index": closest_by_card.get("log_index"),
-                            "closest_by_card_abs_delta": closest_by_card.get("candidate_abs_delta_to_actual"),
-                            "profile_conditions": p_conditions,
-                            "profile_descendant_tables": sorted(list(p_desc_tables)),
-                            "lineage_incomplete": p_lineage_incomplete,
-                        },
-                        run_id="pre-fix",
-                    )
-            # #endregion
             matches.append({
                 "expression": log_entries[best_lidx]["expression"],
                 "log_index": best_lidx,
@@ -1220,48 +946,6 @@ def update_actual_cardinality_json(
     current = read_actual_cardinality_json()
     changes_made = False
 
-    # #region agent log
-    if DEBUG_FEEDBACK_BENCHMARK:
-        rows_by_expr = {}
-        for m in matches:
-            if m["expression"] in cte_expressions:
-                continue
-            e = m["expression"]
-            rows_by_expr.setdefault(e, []).append(
-                {
-                    "profile_join_index": m.get("profile_join_index"),
-                    "log_index": m.get("log_index"),
-                    "actual_cardinality": m["actual_cardinality"],
-                }
-            )
-        dup_expr = {k: v for k, v in rows_by_expr.items() if len(v) > 1}
-        conflict_same_expr = {
-            k: v
-            for k, v in dup_expr.items()
-            if len({r["actual_cardinality"] for r in v}) > 1
-        }
-        _agent_debug_ndjson(
-            "H-batch",
-            "update_actual_cardinality_json:entry",
-            "same-expression collisions in matches batch",
-            {
-                "query_nr": query_nr,
-                "iteration": iteration,
-                "n_matches": len(matches),
-                "n_json_keys_before": len(current),
-                "n_unique_expr_non_cte": len(rows_by_expr),
-                "n_expr_with_multiple_matches": len(dup_expr),
-                "n_expr_conflict_multi_actual": len(conflict_same_expr),
-                "sample_conflict": [
-                    {
-                        "expr_tail": k[-200:] if len(k) > 200 else k,
-                        "rows": conflict_same_expr[k],
-                    }
-                    for k in list(conflict_same_expr.keys())[:3]
-                ],
-            },
-        )
-    # #endregion
 
     for match in matches:
         expression = match["expression"]
@@ -1277,26 +961,6 @@ def update_actual_cardinality_json(
         elif expression in current:
             # Legacy fallback for pre-namespaced JSON files.
             existing_key = expression
-        # #region agent log
-        if DEBUG_FEEDBACK_BENCHMARK:
-            _agent_debug_ndjson(
-                "H-source-ns-stale",
-                "update_actual_cardinality_json:key_state",
-                "namespace key state before cardinality update",
-                {
-                    "query_nr": query_nr,
-                    "iteration": iteration,
-                    "plan_fingerprint": plan_fingerprint,
-                    "key_exists": namespaced_key in current,
-                    "key_cardinality": (
-                        int(current[namespaced_key]) if namespaced_key in current else None
-                    ),
-                    "actual_cardinality": int(actual_card),
-                    "expr_tail": expression[-200:] if len(expression) > 200 else expression,
-                },
-                run_id="pre-fix",
-            )
-        # #endregion
 
         if existing_key is not None:
             existing_card = current[existing_key]
@@ -1321,26 +985,6 @@ def update_actual_cardinality_json(
                         f"      Existing: {int(existing_card)}, New: {int(actual_card)}, "
                         f"Delta: {abs_delta} ({rel_delta:.6%})"
                     )
-                    if DEBUG_FEEDBACK_BENCHMARK:
-                        _agent_debug_ndjson(
-                            "H-json-small-drift",
-                            "update_actual_cardinality_json:small_drift",
-                            "stable-plan small drift treated as noise; JSON unchanged",
-                            {
-                                "query_nr": query_nr,
-                                "iteration": iteration,
-                                "plan_stable": plan_stable,
-                                "existing": int(existing_card),
-                                "new": int(actual_card),
-                                "abs_delta": abs_delta,
-                                "rel_delta": rel_delta,
-                                "match_log_index": match.get("log_index"),
-                                "match_profile_join_index": match.get("profile_join_index"),
-                                "expr_len": len(expression),
-                                "expr_tail": expression[-200:] if len(expression) > 200 else expression,
-                            },
-                            run_id="pre-fix",
-                        )
                     continue
                 if _stable:
                     print(f"    [ALARM] Cardinality mismatch for expression!")
@@ -1349,105 +993,15 @@ def update_actual_cardinality_json(
                         f"    [INFO] Cardinality update (plan changed vs last iteration; "
                         f"overwriting JSON):"
                     )
-                # #region agent log
-                if DEBUG_FEEDBACK_BENCHMARK and (abs_delta >= LARGE_DELTA_ABS_THRESHOLD and rel_delta >= LARGE_DELTA_REL_THRESHOLD):
-                    _agent_debug_ndjson(
-                        "H-large-delta-overwrite",
-                        "update_actual_cardinality_json:large_delta",
-                        "large JSON overwrite candidate",
-                        {
-                            "query_nr": query_nr,
-                            "iteration": iteration,
-                            "plan_stable": plan_stable,
-                            "existing": int(existing_card),
-                            "new": int(actual_card),
-                            "abs_delta": abs_delta,
-                            "rel_delta": rel_delta,
-                            "match_log_index": match.get("log_index"),
-                            "match_profile_join_index": match.get("profile_join_index"),
-                            "expr_len": len(expression),
-                            "expr_tail": expression[-200:] if len(expression) > 200 else expression,
-                        },
-                        run_id="pre-fix",
-                    )
-                # #endregion
                 print(f"      Expression: {expression}")
                 print(f"      Existing: {int(existing_card)}, New: {int(actual_card)}")
-                # #region agent log
-                if DEBUG_FEEDBACK_BENCHMARK:
-                    _agent_debug_ndjson(
-                        "H-json-alarm",
-                        "update_actual_cardinality_json:alarm",
-                        "existing JSON value differs from new match actual",
-                        {
-                            "query_nr": query_nr,
-                            "iteration": iteration,
-                            "plan_stable": plan_stable,
-                            "severity": "alarm" if _stable else "info_plan_changed",
-                            "existing": int(existing_card),
-                            "new": int(actual_card),
-                            "abs_delta": abs_delta,
-                            "rel_delta": rel_delta,
-                            "match_log_index": match.get("log_index"),
-                            "match_profile_join_index": match.get("profile_join_index"),
-                            "expr_len": len(expression),
-                            "expr_tail": expression[-200:] if len(expression) > 200 else expression,
-                        },
-                        run_id="pre-fix",
-                    )
-                # #endregion
                 # Update to new value (the latest run is most accurate)
-                # #region agent log
-                if DEBUG_FEEDBACK_BENCHMARK:
-                    _agent_debug_ndjson(
-                        "H-json-write",
-                        "update_actual_cardinality_json",
-                        "writing updated cardinality entry",
-                        {
-                            "query_nr": query_nr,
-                            "iteration": iteration,
-                            "existing_key_tail": (
-                                existing_key[-220:] if existing_key and len(existing_key) > 220 else existing_key
-                            ),
-                            "write_key_tail": (
-                                namespaced_key[-220:] if len(namespaced_key) > 220 else namespaced_key
-                            ),
-                            "existing_cardinality": int(existing_card),
-                            "new_cardinality": int(actual_card),
-                            "match_profile_join_index": match.get("profile_join_index"),
-                            "match_log_index": match.get("log_index"),
-                            "expression_tail": expression[-220:] if len(expression) > 220 else expression,
-                            "same_key": existing_key == namespaced_key,
-                        },
-                        run_id="pre-fix",
-                    )
-                # #endregion
                 current[namespaced_key] = float(actual_card)
                 if existing_key != namespaced_key and existing_key in current:
                     del current[existing_key]
                 changes_made = True
             # else: same value, no change needed
         else:
-            # #region agent log
-            if DEBUG_FEEDBACK_BENCHMARK:
-                _agent_debug_ndjson(
-                    "H-json-write",
-                    "update_actual_cardinality_json",
-                    "writing brand new cardinality entry",
-                    {
-                        "query_nr": query_nr,
-                        "iteration": iteration,
-                        "write_key_tail": (
-                            namespaced_key[-220:] if len(namespaced_key) > 220 else namespaced_key
-                        ),
-                        "new_cardinality": int(actual_card),
-                        "match_profile_join_index": match.get("profile_join_index"),
-                        "match_log_index": match.get("log_index"),
-                        "expression_tail": expression[-220:] if len(expression) > 220 else expression,
-                    },
-                    run_id="pre-fix",
-                )
-            # #endregion
             current[namespaced_key] = float(actual_card)
             changes_made = True
             print(f"    [NEW] {expression} -> {actual_card}")
@@ -1600,24 +1154,6 @@ def verify_injection(
             )
             if is_small_stable_drift:
                 tolerated_small_drifts.append((entry["expression"], injected_val, actual_val, abs_delta, rel_delta))
-                # #region agent log
-                if DEBUG_FEEDBACK_BENCHMARK:
-                    _agent_debug_ndjson(
-                        "H-verify-small-drift",
-                        "verify_injection:check4",
-                        "check4 tolerated small stable-plan drift",
-                        {
-                            "iteration": iteration,
-                            "plan_stable": plan_stable,
-                            "injected": int(injected_val),
-                            "actual": int(actual_val),
-                            "abs_delta": abs_delta,
-                            "rel_delta": rel_delta,
-                            "expr_tail": entry["expression"][-200:] if len(entry["expression"]) > 200 else entry["expression"],
-                        },
-                        run_id="post-fix",
-                    )
-                # #endregion
             elif injected_val != actual_val:
                 injected_vs_actual_mismatches.append(
                     (expr, injected_val, actual_val)
@@ -1629,62 +1165,6 @@ def verify_injection(
         for expr, inj, act in injected_vs_actual_mismatches:
             print(f"      {expr}")
             print(f"        Injected: {inj}, Actual: {act}")
-            # #region agent log
-            if DEBUG_FEEDBACK_BENCHMARK:
-                same_expr_lines = []
-                for idx, e in enumerate(log_entries):
-                    if e["expression"] == expr:
-                        same_expr_lines.append(
-                            {
-                                "log_index": idx,
-                                "is_injected": bool(e["is_injected"]),
-                                "cardinality": int(e["cardinality"]),
-                            }
-                        )
-                mismatch_entry = None
-                for e in log_entries:
-                    if e["expression"] == expr and e["is_injected"]:
-                        mismatch_entry = e
-                        break
-                profile_candidate_rows = []
-                if mismatch_entry is not None:
-                    expr_norm = normalize_condition_set(mismatch_entry.get("filters", []))
-                    expr_tables = set(mismatch_entry.get("tables", []))
-                    for pidx, pj in enumerate(profile_joins):
-                        p_norm = normalize_condition_set(parse_explain_conditions(pj.get("conditions", "")))
-                        p_desc_tables = set(pj.get("descendant_tables", set()))
-                        cond_equal = p_norm == expr_norm
-                        table_equal = (not p_desc_tables and not expr_tables) or (p_desc_tables == expr_tables)
-                        table_overlap = bool(p_desc_tables & expr_tables)
-                        if cond_equal or table_equal or table_overlap:
-                            profile_candidate_rows.append(
-                                {
-                                    "profile_join_index": pidx,
-                                    "actual_cardinality": int(pj.get("actual_cardinality", 0)),
-                                    "estimated_cardinality": int(pj.get("estimated_cardinality", 0)),
-                                    "plan_path": list(pj.get("plan_path", [])),
-                                    "descendant_tables": sorted(list(p_desc_tables)),
-                                    "lineage_incomplete": bool(pj.get("lineage_incomplete", False)),
-                                    "cond_equal": bool(cond_equal),
-                                    "table_equal": bool(table_equal),
-                                    "table_overlap": bool(table_overlap),
-                                }
-                            )
-                _agent_debug_ndjson(
-                    "H-verify-mismatch-detail",
-                    "verify_injection:check4",
-                    "injected != actual mismatch detail",
-                    {
-                        "iteration": iteration,
-                        "expression_tail": expr[-220:] if len(expr) > 220 else expr,
-                        "injected": int(inj),
-                        "actual": int(act),
-                        "same_expression_log_lines": same_expr_lines,
-                        "candidate_profile_joins": profile_candidate_rows[:10],
-                    },
-                    run_id="pre-fix",
-                )
-            # #endregion
         # Note: this is informational, not an assertion failure, because
         # if the plan structure changed, actual cardinality naturally differs.
         # The oscillation detector handles this case.
@@ -1744,42 +1224,39 @@ def verify_injection(
                     f"profile_est={m.get('profile_estimated_cardinality')}, "
                     f"path={m.get('profile_plan_path')}: {expr_tail}"
                 )
-            # #region agent log
-            if DEBUG_FEEDBACK_BENCHMARK:
-                _agent_debug_ndjson(
-                    "H-verify-ambiguous-proxy",
-                    "verify_injection:check7",
-                    "non-stage0 ambiguous selections summary",
-                    {
-                        "iteration": iteration,
-                        "count": len(non_stage0),
-                        "sample": [
-                            {
-                                "profile_join_index": m.get("profile_join_index"),
-                                "log_index": m.get("log_index"),
-                                "selected_stage": m.get("selected_stage"),
-                                "selected_table_delta": m.get("selected_table_delta"),
-                                "selected_cond_diff": m.get("selected_cond_diff"),
-                                "selected_abs_delta_to_profile_est": m.get("selected_abs_delta_to_profile_est"),
-                                "profile_estimated_cardinality": m.get("profile_estimated_cardinality"),
-                                "profile_plan_path": m.get("profile_plan_path"),
-                                "candidate_count": m.get("candidate_count"),
-                                "expr_tail": (
-                                    m.get("expression", "")[-220:]
-                                    if len(m.get("expression", "")) > 220
-                                    else m.get("expression", "")
-                                ),
-                            }
-                            for m in non_stage0[:8]
-                        ],
-                    },
-                    run_id="pre-fix",
-                )
-            # #endregion
 
 # ============================================================================
 # MAIN LOOP PER QUERY
 # ============================================================================
+
+
+def _feedback_query_result(
+    iterations,
+    converged,
+    plan_changed_iterations,
+    *,
+    error=False,
+    oscillation=False,
+    cycle_length=None,
+    feedback_unique_plans=0,
+    final_plan_fingerprint=None,
+    n_injected=0,
+):
+    """Single schema for run_single_query return dict (avoids drift between branches)."""
+    res = {
+        "iterations": iterations,
+        "converged": converged,
+        "plan_changed_iterations": plan_changed_iterations,
+        "error": error,
+        "feedback_unique_plans": feedback_unique_plans,
+        "final_plan_fingerprint": final_plan_fingerprint,
+        "n_injected": n_injected,
+    }
+    if oscillation:
+        res["oscillation"] = True
+        res["cycle_length"] = cycle_length
+    return res
+
 
 def run_single_query(query_nr, query_sql):
     """
@@ -1794,6 +1271,9 @@ def run_single_query(query_nr, query_sql):
         - "iterations": int (number of iterations until convergence)
         - "converged": bool
         - "plan_changed_iterations": list of iteration numbers where plan changed
+        - "feedback_unique_plans": int (distinct plan structure texts seen)
+        - "final_plan_fingerprint": str or None (last successful iteration)
+        - "n_injected": int — log lines marked INJECTED on the last completed iteration
     """
     print(f"\n{'='*60}")
     print(f"  Query {query_nr}")
@@ -1808,125 +1288,50 @@ def run_single_query(query_nr, query_sql):
     seen_plan_structures = []  # Track all seen plan structures for oscillation detection
     expr_match_history = {}
     unsafe_expressions = set()
+    unique_plan_texts = set()
+    last_plan_fingerprint = None
+    # Cardinality lines marked INJECTED on the last completed iteration (for benchmarks).
+    feedback_last_n_injected = 0
 
     for iteration in range(1, MAX_ITERATIONS + 1):
         print(f"\n  --- Iteration {iteration} ---")
 
-        # Step 2: Clear the cardinality log (but NOT the JSON — it accumulates)
+        # Step 2: Fresh cardinality log for this iteration (JSON still accumulates).
         clear_cardinality_log()
 
         # Step 3: Execute query once per iteration (no global plan fingerprint namespace).
-        clear_cardinality_log()
         profile = run_query_with_json_profile(
             query_sql,
             plan_fingerprint_hint=None,
         )
         if profile is None:
             print(f"  [ERROR] Query {query_nr} failed on iteration {iteration}. Skipping.")
-            return {
-                "iterations": iteration,
-                "converged": False,
-                "plan_changed_iterations": plan_changed_iterations,
-                "error": True,
-            }
+            return _feedback_query_result(
+                iteration,
+                False,
+                plan_changed_iterations,
+                error=True,
+                feedback_unique_plans=len(unique_plan_texts),
+                final_plan_fingerprint=last_plan_fingerprint,
+                n_injected=feedback_last_n_injected,
+            )
 
         # Step 4: Get plan structure and parse everything FIRST
         root = profile.get("children", [profile])[0] if profile.get("children") else profile
         current_plan_text = get_plan_structure_text(root)
         current_plan_fingerprint = compute_plan_fingerprint(current_plan_text)
-        # #region agent log
-        if DEBUG_FEEDBACK_BENCHMARK:
-            _agent_debug_ndjson(
-                "H-fp-discovery-exec",
-                "run_single_query:execution",
-                "execution run fingerprint after applying target namespace hint",
-                {
-                    "query_nr": query_nr,
-                    "iteration": iteration,
-                    "target_plan_fingerprint": None,
-                    "current_plan_fingerprint": current_plan_fingerprint,
-                    "fingerprint_match": None,
-                },
-                run_id="pre-fix",
-            )
-        # #endregion
+        unique_plan_texts.add(current_plan_text)
+        last_plan_fingerprint = current_plan_fingerprint
 
         # Step 5: Parse joins from the JSON profile
         cte_lineage = build_cte_lineage(root)
         profile_joins = extract_join_nodes(root, cte_lineage)
         print(f"  Found {len(profile_joins)} join(s) in physical plan.")
-        # #region agent log
-        if DEBUG_FEEDBACK_BENCHMARK:
-            join_signature_rows = []
-            for pidx, pj in enumerate(profile_joins):
-                join_signature_rows.append(
-                    {
-                        "profile_join_index": pidx,
-                        "actual_cardinality": int(pj.get("actual_cardinality", 0)),
-                        "estimated_cardinality": int(pj.get("estimated_cardinality", 0)),
-                        "conditions": pj.get("conditions", ""),
-                        "descendant_tables": sorted(list(pj.get("descendant_tables", set()))),
-                        "plan_path": list(pj.get("plan_path", [])),
-                        "lineage_incomplete": bool(pj.get("lineage_incomplete", False)),
-                        "child_context": pj.get("child_context", []),
-                        "ancestor_context": pj.get("ancestor_context", []),
-                        "subtree_scan_signatures": pj.get("subtree_scan_signatures", []),
-                        "subtree_operator_signatures": pj.get("subtree_operator_signatures", []),
-                        "subtree_structure_hash": pj.get("subtree_structure_hash", ""),
-                    }
-                )
-            _agent_debug_ndjson(
-                "H-D3-profile-join-signatures",
-                "run_single_query:post_profile_parse",
-                "all profile join signatures",
-                {
-                    "query_nr": query_nr,
-                    "iteration": iteration,
-                    "rows": join_signature_rows[:30],
-                },
-                run_id="diag-v2",
-            )
-        # #endregion
 
         # Step 6: Parse the cardinality log
         log_entries = parse_cardinality_log()
+        feedback_last_n_injected = sum(1 for e in log_entries if e.get("is_injected"))
         print(f"  Found {len(log_entries)} log entries in cardinality_log.txt.")
-        # #region agent log
-        if DEBUG_FEEDBACK_BENCHMARK:
-            core_key_rows = {}
-            for idx, le in enumerate(log_entries):
-                expr = le.get("expression", "")
-                core_expr = re.sub(r" CtxOcc: \d+$", "", expr)
-                core_key_rows.setdefault(core_expr, []).append(
-                    {
-                        "log_index": idx,
-                        "is_injected": bool(le.get("is_injected")),
-                        "cardinality": int(le.get("cardinality", 0)),
-                    }
-                )
-            duplicate_core_rows = [
-                {
-                    "core_expr_tail": k[-220:] if len(k) > 220 else k,
-                    "occurrences": v,
-                }
-                for k, v in core_key_rows.items()
-                if len(v) > 1
-            ]
-            _agent_debug_ndjson(
-                "H-D4-log-core-key-occurrences",
-                "run_single_query:post_log_parse",
-                "same core key occurrence summary (without CtxOcc)",
-                {
-                    "query_nr": query_nr,
-                    "iteration": iteration,
-                    "n_log_entries": len(log_entries),
-                    "n_unique_core_keys": len(core_key_rows),
-                    "n_duplicate_core_keys": len(duplicate_core_rows),
-                    "duplicate_core_rows": duplicate_core_rows[:20],
-                },
-                run_id="diag-v2",
-            )
-        # #endregion
 
         # Step 7: Detect CTE duplicates
         cte_exprs = detect_cte_duplicates(log_entries)
@@ -1938,109 +1343,6 @@ def run_single_query(query_nr, query_sql):
         print(f"  Matched {len(matches)} expression(s) to actual cardinalities.")
         if unresolved:
             print(f"  [MATCH WARN] Unresolved physical joins: {len(unresolved)}")
-        # #region agent log
-        if DEBUG_FEEDBACK_BENCHMARK:
-            _agent_debug_ndjson(
-                "H-D1-unresolved-joins",
-                "run_single_query:post_match",
-                "unresolved profile joins snapshot",
-                {
-                    "query_nr": query_nr,
-                    "iteration": iteration,
-                    "count": len(unresolved),
-                    "rows": unresolved[:8],
-                },
-                run_id="diag-context",
-            )
-        # #endregion
-        # #region agent log
-        if DEBUG_FEEDBACK_BENCHMARK:
-            matched_key_rows = []
-            for m in matches:
-                expr = m.get("expression", "")
-                relsets_match = re.search(r"RelSets: (\[[^\]]*\])", expr)
-                numrels_match = re.search(r"NumRels: (\[[^\]]*\])", expr)
-                ctx_inputs_match = re.search(r"CtxInputCards: (\[[^\]]*\])", expr)
-                ctx_parent_split_match = re.search(r"CtxParentSplit: (.*?) CtxEdgeSig:", expr)
-                ctx_edge_sig_match = re.search(r"CtxEdgeSig: (\[[^\]]*\])", expr)
-                ctx_occ_match = re.search(r"CtxOcc: (\d+)$", expr)
-                matched_key_rows.append(
-                    {
-                        "profile_join_index": m.get("profile_join_index"),
-                        "log_index": m.get("log_index"),
-                        "actual_cardinality": int(m.get("actual_cardinality", 0)),
-                        "relsets": relsets_match.group(1) if relsets_match else None,
-                        "numrels": numrels_match.group(1) if numrels_match else None,
-                        "ctx_input_cards": ctx_inputs_match.group(1) if ctx_inputs_match else None,
-                        "ctx_parent_split": (
-                            ctx_parent_split_match.group(1)
-                            if ctx_parent_split_match
-                            else None
-                        ),
-                        "ctx_edge_sig": (
-                            ctx_edge_sig_match.group(1)
-                            if ctx_edge_sig_match
-                            else None
-                        ),
-                        "ctx_occ": int(ctx_occ_match.group(1)) if ctx_occ_match else None,
-                        "child_context": (
-                            profile_joins[m.get("profile_join_index")].get("child_context", [])
-                            if isinstance(m.get("profile_join_index"), int)
-                            and 0 <= m.get("profile_join_index") < len(profile_joins)
-                            else []
-                        ),
-                        "expr_tail": expr[-200:] if len(expr) > 200 else expr,
-                    }
-                )
-            _agent_debug_ndjson(
-                "H-D2-match-key-components",
-                "run_single_query:post_match",
-                "matched expression key component snapshot",
-                {
-                    "query_nr": query_nr,
-                    "iteration": iteration,
-                    "rows": matched_key_rows[:10],
-                },
-                run_id="diag-context",
-            )
-        # #endregion
-        # #region agent log
-        if DEBUG_FEEDBACK_BENCHMARK:
-            expr_to_log_rows = {}
-            for idx, le in enumerate(log_entries):
-                expr_to_log_rows.setdefault(le["expression"], []).append(
-                    {
-                        "log_index": idx,
-                        "is_injected": bool(le.get("is_injected")),
-                        "cardinality_int": int(le.get("cardinality", 0)),
-                    }
-                )
-            match_trace_rows = []
-            for m in matches:
-                expr = m["expression"]
-                match_trace_rows.append(
-                    {
-                        "profile_join_index": m.get("profile_join_index"),
-                        "selected_log_index": m.get("log_index"),
-                        "actual_cardinality_int": int(m.get("actual_cardinality", 0)),
-                        "same_expr_log_rows": expr_to_log_rows.get(expr, []),
-                        "expr_tail": expr[-180:] if len(expr) > 180 else expr,
-                    }
-                )
-            _agent_debug_ndjson(
-                "H-match-trace",
-                "run_single_query:post_match",
-                "matched joins with all same-expression log rows",
-                {
-                    "query_nr": query_nr,
-                    "iteration": iteration,
-                    "n_log_entries": len(log_entries),
-                    "n_matches": len(matches),
-                    "rows": match_trace_rows,
-                },
-                run_id="pre-fix",
-            )
-        # #endregion
 
         # Step 9: Save pre-update JSON snapshot for verification, then update
         pre_update_json = read_actual_cardinality_json()
@@ -2095,51 +1397,6 @@ def run_single_query(query_nr, query_sql):
                     "candidate_count": int(m.get("candidate_count", 0)),
                 }
             )
-        # #region agent log
-        if DEBUG_FEEDBACK_BENCHMARK:
-            for m in matches:
-                expr = m["expression"]
-                pidx = m.get("profile_join_index")
-                relsets_match = re.search(r"RelSets: (\[[^\]]*\])", expr)
-                numrels_match = re.search(r"NumRels: (\[[^\]]*\])", expr)
-                ctx_inputs_match = re.search(r"CtxInputCards: (\[[^\]]*\])", expr)
-                ctx_parent_split_match = re.search(r"CtxParentSplit: (.*?) CtxEdgeSig:", expr)
-                ctx_edge_sig_match = re.search(r"CtxEdgeSig: (\[[^\]]*\])", expr)
-                ctx_occ_match = re.search(r"CtxOcc: (\d+)$", expr)
-                pj = profile_joins[pidx] if isinstance(pidx, int) and 0 <= pidx < len(profile_joins) else {}
-                _agent_debug_ndjson(
-                    "H-R2-match-context-vs-key",
-                    "run_single_query:post_match_history",
-                    "selected match compared against physical-join context",
-                    {
-                        "query_nr": query_nr,
-                        "iteration": iteration,
-                        "profile_join_index": pidx,
-                        "log_index": m.get("log_index"),
-                        "candidate_count": int(m.get("candidate_count", 0)),
-                        "actual_cardinality": int(m.get("actual_cardinality", 0)),
-                        "profile_estimated_cardinality": int(m.get("profile_estimated_cardinality", 0)),
-                        "profile_conditions": pj.get("conditions", ""),
-                        "profile_descendant_tables": sorted(list(pj.get("descendant_tables", set()))),
-                        "profile_plan_path": list(pj.get("plan_path", [])),
-                        "profile_child_context": pj.get("child_context", []),
-                        "profile_ancestor_context": pj.get("ancestor_context", []),
-                        "profile_subtree_scan_signatures": pj.get("subtree_scan_signatures", []),
-                        "profile_subtree_operator_signatures": pj.get("subtree_operator_signatures", []),
-                        "profile_subtree_structure_hash": pj.get("subtree_structure_hash", ""),
-                        "key_relsets": relsets_match.group(1) if relsets_match else None,
-                        "key_numrels": numrels_match.group(1) if numrels_match else None,
-                        "key_ctx_input_cards": ctx_inputs_match.group(1) if ctx_inputs_match else None,
-                        "key_ctx_parent_split": (
-                            ctx_parent_split_match.group(1) if ctx_parent_split_match else None
-                        ),
-                        "key_ctx_edge_sig": ctx_edge_sig_match.group(1) if ctx_edge_sig_match else None,
-                        "key_ctx_occ": int(ctx_occ_match.group(1)) if ctx_occ_match else None,
-                        "expr_tail": expr[-220:] if len(expr) > 220 else expr,
-                    },
-                    run_id="root-cause-pre-fix",
-                )
-        # #endregion
         # Strict safety gate: never inject ambiguous matches or conflicting
         # same-key cardinalities (beyond tolerated tiny drift).
         newly_unsafe = set()
@@ -2160,21 +1417,6 @@ def run_single_query(query_nr, query_sql):
                     f"{sorted(list(vals))} -- {expr}"
                 )
                 newly_unsafe.add(expr)
-                # #region agent log
-                if DEBUG_FEEDBACK_BENCHMARK:
-                    _agent_debug_ndjson(
-                        "H-R3-batch-collision",
-                        "run_single_query:unsafe_quarantine",
-                        "same key maps to conflicting actuals within iteration",
-                        {
-                            "query_nr": query_nr,
-                            "iteration": iteration,
-                            "expr_tail": expr[-220:] if len(expr) > 220 else expr,
-                            "cards": sorted(list(vals)),
-                        },
-                        run_id="root-cause-pre-fix",
-                    )
-                # #endregion
         # Dynamic-filter guard: if a matched subtree scan has dynamic filter columns
         # outside this join's own condition columns, treat key as context-unsafe.
         for m in matches:
@@ -2194,27 +1436,6 @@ def run_single_query(query_nr, query_sql):
                     f"condition: {extra_dyn_cols} -- {expr}"
                 )
                 newly_unsafe.add(expr)
-                # #region agent log
-                if DEBUG_FEEDBACK_BENCHMARK:
-                    _agent_debug_ndjson(
-                        "H-R7-dynamic-filter-mismatch",
-                        "run_single_query:unsafe_quarantine",
-                        "subtree dynamic filters include columns outside join condition",
-                        {
-                            "query_nr": query_nr,
-                            "iteration": iteration,
-                            "expr_tail": expr[-220:] if len(expr) > 220 else expr,
-                            "profile_join_index": pidx,
-                            "condition_columns": sorted(list(cond_cols)),
-                            "dynamic_filter_columns": sorted(list(dyn_cols)),
-                            "extra_dynamic_filter_columns": extra_dyn_cols,
-                            "subtree_operator_signatures": pj.get(
-                                "subtree_operator_signatures", []
-                            ),
-                        },
-                        run_id="root-cause-pre-fix",
-                    )
-                # #endregion
         for expr, hist in expr_match_history.items():
             if len(hist) < 2:
                 continue
@@ -2236,47 +1457,6 @@ def run_single_query(query_nr, query_sql):
                     f"prev={prev_actual}, curr={curr_actual} -- {expr}"
                 )
                 newly_unsafe.add(expr)
-                # #region agent log
-                if DEBUG_FEEDBACK_BENCHMARK:
-                    _agent_debug_ndjson(
-                        "H-R4-cross-iter-collision",
-                        "run_single_query:unsafe_quarantine",
-                        "same key changed actual across iterations",
-                        {
-                            "query_nr": query_nr,
-                            "iteration": iteration,
-                            "expr_tail": expr[-220:] if len(expr) > 220 else expr,
-                            "prev": {
-                                "iteration": prev.get("iteration"),
-                                "actual_cardinality": prev_actual,
-                                "profile_plan_path": prev.get("profile_plan_path"),
-                                "profile_descendant_tables": prev.get("profile_descendant_tables"),
-                                "profile_conditions": prev.get("profile_conditions"),
-                                "profile_ancestor_context": prev.get("profile_ancestor_context", []),
-                                "profile_subtree_scan_signatures": prev.get("profile_subtree_scan_signatures", []),
-                                "profile_subtree_operator_signatures": prev.get("profile_subtree_operator_signatures", []),
-                                "profile_subtree_structure_hash": prev.get("profile_subtree_structure_hash", ""),
-                                "candidate_count": prev.get("candidate_count"),
-                            },
-                            "curr": {
-                                "iteration": curr.get("iteration"),
-                                "actual_cardinality": curr_actual,
-                                "profile_plan_path": curr.get("profile_plan_path"),
-                                "profile_descendant_tables": curr.get("profile_descendant_tables"),
-                                "profile_conditions": curr.get("profile_conditions"),
-                                "profile_ancestor_context": curr.get("profile_ancestor_context", []),
-                                "profile_subtree_scan_signatures": curr.get("profile_subtree_scan_signatures", []),
-                                "profile_subtree_operator_signatures": curr.get("profile_subtree_operator_signatures", []),
-                                "profile_subtree_structure_hash": curr.get("profile_subtree_structure_hash", ""),
-                                "candidate_count": curr.get("candidate_count"),
-                            },
-                            "abs_delta": abs_delta,
-                            "rel_delta": rel_delta,
-                            "plan_stable": plan_stable,
-                        },
-                        run_id="root-cause-pre-fix",
-                    )
-                # #endregion
         unsafe_expressions.update(newly_unsafe)
         purge_unsafe_expressions_from_json(
             unsafe_expressions,
@@ -2294,80 +1474,6 @@ def run_single_query(query_nr, query_sql):
                 f"    [SKIP-UNSAFE] Skipping {skipped_unsafe} match(es) due to "
                 f"ambiguity/context collision quarantine."
             )
-        # #region agent log
-        if DEBUG_FEEDBACK_BENCHMARK:
-            for m in matches:
-                expr = m["expression"]
-                pidx = m.get("profile_join_index")
-                profile_conditions = ""
-                profile_desc_tables = []
-                if isinstance(pidx, int) and 0 <= pidx < len(profile_joins):
-                    profile_conditions = profile_joins[pidx].get("conditions", "")
-                    profile_desc_tables = sorted(
-                        list(profile_joins[pidx].get("descendant_tables", set()))
-                    )
-                if expr in active_pre_update_json:
-                    existing_card = int(active_pre_update_json[expr])
-                    new_card = int(m["actual_cardinality"])
-                    abs_delta = abs(existing_card - new_card)
-                    max_mag = max(abs(existing_card), abs(new_card), 1)
-                    rel_delta = float(abs_delta) / float(max_mag)
-                    if abs_delta >= LARGE_DELTA_ABS_THRESHOLD and rel_delta >= LARGE_DELTA_REL_THRESHOLD:
-                        _agent_debug_ndjson(
-                            "H-q7-large-delta-trace",
-                            "run_single_query:pre_update",
-                            "large delta before JSON update",
-                            {
-                                "query_nr": query_nr,
-                                "iteration": iteration,
-                                "plan_stable": plan_stable,
-                                "target_plan_fingerprint": None,
-                                "current_plan_fingerprint": current_plan_fingerprint,
-                                "existing": existing_card,
-                                "new": new_card,
-                                "abs_delta": abs_delta,
-                                "rel_delta": rel_delta,
-                                "match_log_index": m.get("log_index"),
-                                "match_profile_join_index": m.get("profile_join_index"),
-                                "same_expr_log_rows": [
-                                    {
-                                        "log_index": idx,
-                                        "is_injected": bool(le.get("is_injected")),
-                                        "cardinality_int": int(le.get("cardinality", 0)),
-                                    }
-                                    for idx, le in enumerate(log_entries)
-                                    if le["expression"] == expr
-                                ],
-                                "matched_profile_conditions": profile_conditions,
-                                "matched_profile_descendant_tables": profile_desc_tables,
-                                "expr_history": expr_match_history.get(expr, [])[-4:],
-                                "expr_tail": expr[-200:] if len(expr) > 200 else expr,
-                            },
-                            run_id="pre-fix",
-                        )
-                hist = expr_match_history.get(expr, [])
-                if len(hist) >= 2:
-                    prev = hist[-2]
-                    curr = hist[-1]
-                    if prev.get("profile_plan_path") != curr.get("profile_plan_path"):
-                        _agent_debug_ndjson(
-                            "H-planpath-drift",
-                            "run_single_query:pre_update",
-                            "same expression observed at different plan path",
-                            {
-                                "query_nr": query_nr,
-                                "iteration": iteration,
-                                "expression_tail": expr[-220:] if len(expr) > 220 else expr,
-                                "prev_iteration": prev.get("iteration"),
-                                "prev_plan_path": prev.get("profile_plan_path"),
-                                "prev_actual_cardinality": prev.get("actual_cardinality"),
-                                "curr_plan_path": curr.get("profile_plan_path"),
-                                "curr_actual_cardinality": curr.get("actual_cardinality"),
-                                "plan_stable": plan_stable,
-                            },
-                            run_id="pre-fix",
-                        )
-        # #endregion
 
         changes_made = update_actual_cardinality_json(
             matches_to_update,
@@ -2396,12 +1502,14 @@ def run_single_query(query_nr, query_sql):
         # Step 11: Check convergence — plan structure hasn't changed
         if prev_plan_text is not None and current_plan_text == prev_plan_text:
             print(f"  Plan CONVERGED after {iteration} iterations.")
-            return {
-                "iterations": iteration,
-                "converged": True,
-                "plan_changed_iterations": plan_changed_iterations,
-                "error": False,
-            }
+            return _feedback_query_result(
+                iteration,
+                True,
+                plan_changed_iterations,
+                feedback_unique_plans=len(unique_plan_texts),
+                final_plan_fingerprint=last_plan_fingerprint,
+                n_injected=feedback_last_n_injected,
+            )
 
         if prev_plan_text is not None:
             plan_changed_iterations.append(iteration)
@@ -2414,14 +1522,16 @@ def run_single_query(query_nr, query_sql):
             cycle_len = iteration - cycle_start
             print(f"  Plan OSCILLATION detected: cycle of length {cycle_len} "
                   f"(iteration {cycle_start} == iteration {iteration}).")
-            return {
-                "iterations": iteration,
-                "converged": False,
-                "plan_changed_iterations": plan_changed_iterations,
-                "oscillation": True,
-                "cycle_length": cycle_len,
-                "error": False,
-            }
+            return _feedback_query_result(
+                iteration,
+                False,
+                plan_changed_iterations,
+                oscillation=True,
+                cycle_length=cycle_len,
+                feedback_unique_plans=len(unique_plan_texts),
+                final_plan_fingerprint=last_plan_fingerprint,
+                n_injected=feedback_last_n_injected,
+            )
 
         seen_plan_structures.append(current_plan_text)
         prev_plan_text = current_plan_text
@@ -2431,80 +1541,78 @@ def run_single_query(query_nr, query_sql):
             print(f"  No new cardinality entries. Expecting convergence next iteration.")
 
     print(f"  [WARN] Query {query_nr} did NOT converge after {MAX_ITERATIONS} iterations!")
-    return {
-        "iterations": MAX_ITERATIONS,
-        "converged": False,
-        "plan_changed_iterations": plan_changed_iterations,
-        "error": False,
-    }
+    return _feedback_query_result(
+        MAX_ITERATIONS,
+        False,
+        plan_changed_iterations,
+        feedback_unique_plans=len(unique_plan_texts),
+        final_plan_fingerprint=last_plan_fingerprint,
+        n_injected=feedback_last_n_injected,
+    )
 
 
 # ============================================================================
 # MAIN
 # ============================================================================
 
+def check_benchmark_prerequisites():
+    """Abort early if binary, database, or query directory is unusable."""
+    assert os.path.exists(DUCKDB_BIN), f"DuckDB binary not found: {DUCKDB_BIN}"
+    assert os.path.exists(DB_FILE), f"Database not found: {DB_FILE}"
+    assert os.path.isdir(TPCDS_QUERY_DIR), (
+        f"TPC-DS query directory missing: {TPCDS_QUERY_DIR}\n"
+        "Run: python3 scripts/export_tpcds_query_files.py"
+    )
+
+
+def print_global_totals(results):
+    """Print aggregate stats after all queries finish."""
+    total_iterations = sum(r["iterations"] for r in results.values())
+    total_plan_changes = sum(len(r["plan_changed_iterations"]) for r in results.values())
+    total_injected_sum = sum(r.get("n_injected", 0) for r in results.values())
+    sum_unique_plans = sum(r.get("feedback_unique_plans", 0) for r in results.values())
+    n_converged = sum(1 for r in results.values() if r.get("converged"))
+    n_oscillation = sum(1 for r in results.values() if r.get("oscillation"))
+    n_errors = sum(1 for r in results.values() if r.get("error"))
+
+    print("=" * 60)
+    print("  GLOBAL TOTALS (sum over queries in this run)")
+    print("=" * 60)
+    print(f"  Total iterations completed:     {total_iterations}")
+    print(f"  Total plan-change events:       {total_plan_changes}")
+    print(f"  Sum of last-iter n_injected:    {total_injected_sum}")
+    print(f"  Sum of feedback_unique_plans:   {sum_unique_plans}")
+    print(f"  Converged / oscillation / error: {n_converged} / {n_oscillation} / {n_errors}")
+    print("=" * 60)
+    print("  Benchmark complete.")
+
+
 def main():
-    """
-    Main entry point. Extracts TPC-DS queries, runs the iterative feedback
-    loop for each, and prints a final summary.
-    """
+    """Load queries from disk, run feedback per query, print per-query and global summaries."""
     print("=" * 60)
     print("  TPC-DS Cardinality Feedback Benchmark")
     print(f"  Scale Factor: {SCALE_FACTOR}")
     print(f"  Database: {DB_FILE}")
     print(f"  Queries: {TARGET_QUERIES}")
+    print(f"  SQL dir: {TPCDS_QUERY_DIR}")
     print("=" * 60)
 
-    # #region agent log
-    if DEBUG_FEEDBACK_BENCHMARK:
-        _agent_debug_ndjson(
-            "H-startup",
-            "main",
-            "benchmark_run_start",
-            {
-                "TARGET_QUERIES": list(TARGET_QUERIES),
-                "ndjson_paths": [_AGENT_DEBUG_LOG, _AGENT_DEBUG_MIRROR],
-            },
-        )
-        # #region agent log
-        _agent_debug_ndjson(
-            "H-D0-instrumentation-version",
-            "main",
-            "active diagnostics marker",
-            {
-                "diagnostics_version": "diag-v2",
-                "target_queries": list(TARGET_QUERIES),
-            },
-            run_id="diag-v2",
-        )
-        # #endregion
-    # #endregion
+    check_benchmark_prerequisites()
 
-    # Verify DuckDB binary exists
-    assert os.path.exists(DUCKDB_BIN), f"DuckDB binary not found: {DUCKDB_BIN}"
-    assert os.path.exists(DB_FILE), f"Database not found: {DB_FILE}"
+    print("\nLoading TPC-DS queries from SQL files...")
+    queries = load_tpcds_queries(TARGET_QUERIES)
+    assert len(queries) > 0, "No queries loaded — check feedback_queries/tpcds/"
+    print(f"  Loaded {len(queries)} queries.\n")
 
-    # Extract queries
-    print("\nExtracting TPC-DS queries...")
-    queries = extract_tpcds_queries(TARGET_QUERIES)
-    assert len(queries) > 0, "No queries extracted!"
-    print(f"  Extracted {len(queries)} queries.\n")
-
-    # Run each query
     results = {}
     for query_nr in TARGET_QUERIES:
         if query_nr not in queries:
-            print(f"\n  [SKIP] Query {query_nr} not found in TPC-DS query set.")
+            print(f"\n  [SKIP] Query {query_nr}: missing file q{query_nr:02d}.sql")
             continue
-
-        result = run_single_query(query_nr, queries[query_nr])
-        results[query_nr] = result
-
-        # Clean up for next query
+        results[query_nr] = run_single_query(query_nr, queries[query_nr])
         clear_actual_cardinality_json()
         clear_cardinality_log()
 
-    # Final Summary
     print("\n" + "=" * 60)
     print("  FINAL SUMMARY")
     print("=" * 60)
@@ -2523,8 +1631,7 @@ def main():
         changes = len(result["plan_changed_iterations"])
         print(f"  Q{query_nr:<8} {result['iterations']:<12} {status_str:<25} {changes}")
 
-    print("=" * 60)
-    print("  Benchmark complete.")
+    print_global_totals(results)
 
 
 if __name__ == "__main__":

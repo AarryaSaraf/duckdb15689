@@ -8,10 +8,92 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
 
+#include <chrono>
+#include <fstream>
 #include <math.h>
+#include <limits>
 
 namespace duckdb {
+
+static bool StatsExpressionTreeContainsIsNull(const Expression &expr) {
+	if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
+		return true;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON) {
+		auto &cmp = expr.Cast<BoundComparisonExpression>();
+		if (cmp.GetExpressionType() == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			auto side_is_null_const = [](const unique_ptr<Expression> &side) {
+				return side && side->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+				       side->Cast<BoundConstantExpression>().value.IsNull();
+			};
+			if (side_is_null_const(cmp.left) || side_is_null_const(cmp.right)) {
+				return true;
+			}
+		}
+	}
+	bool found = false;
+	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
+		if (!found && StatsExpressionTreeContainsIsNull(child)) {
+			found = true;
+		}
+	});
+	return found;
+}
+
+static bool ContainsEqualityPredicate(const TableFilter &filter) {
+	switch (filter.filter_type) {
+	case TableFilterType::CONSTANT_COMPARISON: {
+		auto &comparison_filter = filter.Cast<ConstantFilter>();
+		return comparison_filter.comparison_type == ExpressionType::COMPARE_EQUAL;
+	}
+	case TableFilterType::CONJUNCTION_AND: {
+		auto &and_filter = filter.Cast<ConjunctionAndFilter>();
+		for (auto &child_filter : and_filter.child_filters) {
+			if (ContainsEqualityPredicate(*child_filter)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	default:
+		return false;
+	}
+}
+
+static bool ContainsIsNullTableFilter(const TableFilter &filter) {
+	switch (filter.filter_type) {
+	case TableFilterType::IS_NULL:
+		return true;
+	case TableFilterType::OPTIONAL_FILTER: {
+		auto &opt = filter.Cast<OptionalFilter>();
+		return opt.child_filter && ContainsIsNullTableFilter(*opt.child_filter);
+	}
+	case TableFilterType::CONJUNCTION_AND: {
+		auto &and_filter = filter.Cast<ConjunctionAndFilter>();
+		for (auto &child_filter : and_filter.child_filters) {
+			if (ContainsIsNullTableFilter(*child_filter)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case TableFilterType::EXPRESSION_FILTER: {
+		auto &expr_filter = filter.Cast<ExpressionFilter>();
+		return StatsExpressionTreeContainsIsNull(*expr_filter.expr);
+	}
+	default:
+		return false;
+	}
+}
 
 static ExpressionBinding GetChildColumnBinding(Expression &expr) {
 	auto ret = ExpressionBinding();
@@ -119,7 +201,9 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 	if (!get.table_filters.filters.empty()) {
 		column_statistics = nullptr;
 		bool has_non_optional_filters = false;
+		bool has_equality_predicate = false;
 		for (auto &it : get.table_filters.filters) {
+			column_statistics = nullptr;
 			if (get.bind_data && (get.function.statistics || get.function.statistics_extended)) {
 				if (get.function.statistics_extended) {
 					auto column_index = ColumnIndex(it.first);
@@ -133,17 +217,44 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 
 			if (column_statistics) {
 				idx_t cardinality_with_filter =
-				    InspectTableFilter(base_table_cardinality, it.first, *it.second, *column_statistics);
+				    InspectTableFilter(cardinality_after_filters, it.first, *it.second, *column_statistics);
+				cardinality_after_filters = MinValue(cardinality_after_filters, cardinality_with_filter);
+			} else if (it.first < get.returned_types.size()) {
+				// No per-column stats from the table function (common for catalog tables): still run filter
+				// inspection so OPTIONAL-wrapped IS NULL, conjunctions, etc. can adjust cardinality.
+				auto unknown_stats = BaseStatistics::CreateUnknown(get.returned_types[it.first]);
+				idx_t cardinality_with_filter =
+				    InspectTableFilter(cardinality_after_filters, it.first, *it.second, unknown_stats);
 				cardinality_after_filters = MinValue(cardinality_after_filters, cardinality_with_filter);
 			}
 
+			has_equality_predicate = has_equality_predicate || ContainsEqualityPredicate(*it.second) ||
+			                         ContainsIsNullTableFilter(*it.second);
 			if (it.second->filter_type != TableFilterType::OPTIONAL_FILTER) {
 				has_non_optional_filters = true;
 			}
+			// #region agent log
+			{
+				auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+				              std::chrono::system_clock::now().time_since_epoch())
+				              .count();
+				std::ofstream alog("/Users/Aarry/Desktop/15689/duckdb15689/.cursor/debug-9c089b.log",
+				                   std::ios::app);
+				if (alog) {
+					alog << "{\"sessionId\":\"9c089b\",\"hypothesisId\":\"A\",\"location\":"
+					        "\"relation_statistics_helper.cpp:ExtractGetStats\","
+					     << "\"message\":\"table_filter\",\"data\":{\"table\":\"" << name
+					     << "\",\"col\":" << it.first << ",\"filter_type\":" << (int)it.second->filter_type
+					     << ",\"expr_has_is_null\":" << (ContainsIsNullTableFilter(*it.second) ? 1 : 0)
+					     << ",\"card_after\":" << cardinality_after_filters << ",\"base_card\":"
+					     << base_table_cardinality << "},\"timestamp\":" << ts << "}\n";
+				}
+			}
+			// #endregion
 		}
 		// if the above code didn't find an equality filter (i.e country_code = "[us]")
 		// and there are other table filters (i.e cost > 50), use default selectivity.
-		bool has_equality_filter = (cardinality_after_filters != base_table_cardinality);
+		bool has_equality_filter = (cardinality_after_filters != base_table_cardinality) || has_equality_predicate;
 		if (!has_equality_filter && has_non_optional_filters) {
 			cardinality_after_filters = MaxValue<idx_t>(
 			    LossyNumericCast<idx_t>(double(base_table_cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY),
@@ -152,6 +263,37 @@ RelationStats RelationStatisticsHelper::ExtractGetStats(LogicalGet &get, ClientC
 		if (base_table_cardinality == 0) {
 			cardinality_after_filters = 0;
 		}
+		// If pushed-down scan filters reduced cardinality, reduce per-column distinct
+		// counts proportionally so join tdoms reflect the filtered domain.
+		if (base_table_cardinality > 0 && cardinality_after_filters < base_table_cardinality) {
+			auto ratio = static_cast<double>(cardinality_after_filters) / static_cast<double>(base_table_cardinality);
+			for (auto &dc : return_stats.column_distinct_count) {
+				auto scaled = LossyNumericCast<idx_t>(ceil(static_cast<double>(dc.distinct_count) * ratio));
+				scaled = MinValue(dc.distinct_count, scaled);
+				dc.distinct_count = cardinality_after_filters == 0 ? 0 : MaxValue<idx_t>(scaled, 1);
+			}
+		}
+
+		// Build a SQL WHERE-clause fragment from the pushed-down table filters so that
+		// callers can construct accurate oracle COUNT(*) subqueries.
+		string scan_filter_sql;
+		for (auto &it : get.table_filters.filters) {
+			if (it.second->filter_type == TableFilterType::OPTIONAL_FILTER) {
+				continue; // skip bloom/optional filters
+			}
+			// Map the pushed-down column index to the actual column name.
+			string col_name;
+			if (it.first < get.names.size()) {
+				col_name = get.names.at(it.first);
+			} else {
+				continue; // can't resolve name, skip
+			}
+			if (!scan_filter_sql.empty()) {
+				scan_filter_sql += " AND ";
+			}
+			scan_filter_sql += it.second->ToString(col_name);
+		}
+		return_stats.scan_filter_string = scan_filter_sql;
 	}
 	return_stats.cardinality = cardinality_after_filters;
 	// update the estimated cardinality of the get as well.
@@ -225,6 +367,7 @@ void RelationStatisticsHelper::CopyRelationStats(RelationStats &to, const Relati
 	to.cardinality = from.cardinality;
 	to.table_name = from.table_name;
 	to.stats_initialized = from.stats_initialized;
+	to.scan_filter_string = from.scan_filter_string;
 }
 
 RelationStats RelationStatisticsHelper::CombineStatsOfReorderableOperator(vector<ColumnBinding> &bindings,
@@ -458,11 +601,182 @@ idx_t RelationStatisticsHelper::InspectTableFilter(idx_t cardinality, idx_t colu
 	switch (filter.filter_type) {
 	case TableFilterType::CONJUNCTION_AND: {
 		auto &and_filter = filter.Cast<ConjunctionAndFilter>();
+		// Special-case date range conjunctions so we don't fall back to coarse DEFAULT_SELECTIVITY.
+		// This targets patterns like d_date >= a AND d_date <= b that currently regress to 0.2.
+		if (base_stats.GetType().id() == LogicalTypeId::DATE && NumericStats::HasMinMax(base_stats)) {
+			auto min_day = NumericStats::GetMin<int32_t>(base_stats);
+			auto max_day = NumericStats::GetMax<int32_t>(base_stats);
+			int32_t lower_day = min_day;
+			int32_t upper_day = max_day;
+			bool saw_supported_date_predicate = false;
+			bool unsupported_child = false;
+			for (auto &child_filter : and_filter.child_filters) {
+				if (child_filter->filter_type != TableFilterType::CONSTANT_COMPARISON) {
+					unsupported_child = true;
+					continue;
+				}
+				auto &comparison_filter = child_filter->Cast<ConstantFilter>();
+				if (comparison_filter.constant.IsNull()) {
+					unsupported_child = true;
+					continue;
+				}
+				Value constant_val;
+				if (!comparison_filter.constant.DefaultTryCastAs(LogicalType::DATE, constant_val, nullptr, false)) {
+					unsupported_child = true;
+					continue;
+				}
+				auto c_day = constant_val.GetValueUnsafe<date_t>().days;
+				switch (comparison_filter.comparison_type) {
+				case ExpressionType::COMPARE_GREATERTHAN:
+					lower_day = MaxValue(lower_day, c_day + 1);
+					saw_supported_date_predicate = true;
+					break;
+				case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+					lower_day = MaxValue(lower_day, c_day);
+					saw_supported_date_predicate = true;
+					break;
+				case ExpressionType::COMPARE_LESSTHAN:
+					upper_day = MinValue(upper_day, c_day - 1);
+					saw_supported_date_predicate = true;
+					break;
+				case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+					upper_day = MinValue(upper_day, c_day);
+					saw_supported_date_predicate = true;
+					break;
+				case ExpressionType::COMPARE_EQUAL:
+					lower_day = MaxValue(lower_day, c_day);
+					upper_day = MinValue(upper_day, c_day);
+					saw_supported_date_predicate = true;
+					break;
+				default:
+					unsupported_child = true;
+					break;
+				}
+			}
+			if (saw_supported_date_predicate && !unsupported_child) {
+				if (lower_day > upper_day) {
+					return 0;
+				}
+				auto domain = static_cast<double>(max_day) - static_cast<double>(min_day) + 1.0;
+				if (domain > 0.0) {
+					auto selected = static_cast<double>(upper_day) - static_cast<double>(lower_day) + 1.0;
+					selected = MaxValue<double>(0.0, MinValue<double>(selected, domain));
+					auto selectivity = selected / domain;
+					auto range_cardinality =
+					    MaxValue<idx_t>(LossyNumericCast<idx_t>(ceil(static_cast<double>(cardinality) * selectivity)), 1U);
+					auto out_cardinality = MinValue(cardinality_after_filters, range_cardinality);
+					return out_cardinality;
+				}
+			}
+		}
+		// Handle integer range predicates (e.g., d_year >= a AND d_year <= b) with min/max stats.
+		if (base_stats.GetType().id() == LogicalTypeId::BIGINT && NumericStats::HasMinMax(base_stats)) {
+			auto min_val = NumericStats::GetMin<int64_t>(base_stats);
+			auto max_val = NumericStats::GetMax<int64_t>(base_stats);
+			int64_t lower_val = min_val;
+			int64_t upper_val = max_val;
+			bool saw_supported_bigint_predicate = false;
+			bool unsupported_child = false;
+			for (auto &child_filter : and_filter.child_filters) {
+				if (child_filter->filter_type != TableFilterType::CONSTANT_COMPARISON) {
+					unsupported_child = true;
+					continue;
+				}
+				auto &comparison_filter = child_filter->Cast<ConstantFilter>();
+				if (comparison_filter.constant.IsNull()) {
+					unsupported_child = true;
+					continue;
+				}
+				Value constant_val;
+				if (!comparison_filter.constant.DefaultTryCastAs(LogicalType::BIGINT, constant_val, nullptr, false)) {
+					unsupported_child = true;
+					continue;
+				}
+				auto c_val = constant_val.GetValueUnsafe<int64_t>();
+				switch (comparison_filter.comparison_type) {
+				case ExpressionType::COMPARE_GREATERTHAN:
+					lower_val = MaxValue(lower_val,
+					                     c_val < std::numeric_limits<int64_t>::max() ? c_val + 1 : c_val);
+					saw_supported_bigint_predicate = true;
+					break;
+				case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+					lower_val = MaxValue(lower_val, c_val);
+					saw_supported_bigint_predicate = true;
+					break;
+				case ExpressionType::COMPARE_LESSTHAN:
+					upper_val = MinValue(upper_val,
+					                     c_val > std::numeric_limits<int64_t>::min() ? c_val - 1 : c_val);
+					saw_supported_bigint_predicate = true;
+					break;
+				case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+					upper_val = MinValue(upper_val, c_val);
+					saw_supported_bigint_predicate = true;
+					break;
+				case ExpressionType::COMPARE_EQUAL:
+					lower_val = MaxValue(lower_val, c_val);
+					upper_val = MinValue(upper_val, c_val);
+					saw_supported_bigint_predicate = true;
+					break;
+				default:
+					unsupported_child = true;
+					break;
+				}
+			}
+			if (saw_supported_bigint_predicate && !unsupported_child) {
+				if (lower_val > upper_val) {
+					return 0;
+				}
+				auto domain = static_cast<double>(max_val) - static_cast<double>(min_val) + 1.0;
+				if (domain > 0.0) {
+					auto selected = static_cast<double>(upper_val) - static_cast<double>(lower_val) + 1.0;
+					selected = MaxValue<double>(0.0, MinValue<double>(selected, domain));
+					auto selectivity = selected / domain;
+					auto range_cardinality =
+					    MaxValue<idx_t>(LossyNumericCast<idx_t>(ceil(static_cast<double>(cardinality) * selectivity)), 1U);
+					auto out_cardinality = MinValue(cardinality_after_filters, range_cardinality);
+					return out_cardinality;
+				}
+			}
+		}
 		for (auto &child_filter : and_filter.child_filters) {
 			cardinality_after_filters = MinValue(
 			    cardinality_after_filters, InspectTableFilter(cardinality, column_index, *child_filter, base_stats));
 		}
 		return cardinality_after_filters;
+	}
+	case TableFilterType::IS_NULL: {
+		// Mirror IsNullFilter::CheckStatistics: empty result vs all-null vs unknown null fraction.
+		if (!base_stats.CanHaveNull()) {
+			return 0;
+		}
+		if (!base_stats.CanHaveNoNull()) {
+			return cardinality;
+		}
+		auto est = LossyNumericCast<idx_t>(ceil(static_cast<double>(cardinality) *
+		                                        RelationStatisticsHelper::DEFAULT_IS_NULL_SELECTIVITY));
+		return MaxValue<idx_t>(1, MinValue(cardinality, est));
+	}
+	case TableFilterType::OPTIONAL_FILTER: {
+		auto &opt = filter.Cast<OptionalFilter>();
+		if (!opt.child_filter) {
+			return cardinality_after_filters;
+		}
+		return InspectTableFilter(cardinality, column_index, *opt.child_filter, base_stats);
+	}
+	case TableFilterType::EXPRESSION_FILTER: {
+		auto &expr_filter = filter.Cast<ExpressionFilter>();
+		if (!StatsExpressionTreeContainsIsNull(*expr_filter.expr)) {
+			return cardinality_after_filters;
+		}
+		if (!base_stats.CanHaveNull()) {
+			return 0;
+		}
+		if (!base_stats.CanHaveNoNull()) {
+			return cardinality;
+		}
+		auto est = LossyNumericCast<idx_t>(ceil(static_cast<double>(cardinality) *
+		                                        RelationStatisticsHelper::DEFAULT_IS_NULL_SELECTIVITY));
+		return MaxValue<idx_t>(1, MinValue(cardinality, est));
 	}
 	case TableFilterType::CONSTANT_COMPARISON: {
 		auto &comparison_filter = filter.Cast<ConstantFilter>();
@@ -472,8 +786,21 @@ idx_t RelationStatisticsHelper::InspectTableFilter(idx_t cardinality, idx_t colu
 		auto column_count = base_stats.GetDistinctCount();
 		// column_count = 0 when there is no column count (i.e parquet scans)
 		if (column_count > 0) {
+			auto used_distinct = column_count;
+			// For small-domain BIGINT columns, prefer max(HLL distinct, min/max domain size).
+			if (base_stats.GetType().id() == LogicalTypeId::BIGINT && NumericStats::HasMinMax(base_stats)) {
+				auto min_val = NumericStats::GetMin<int64_t>(base_stats);
+				auto max_val = NumericStats::GetMax<int64_t>(base_stats);
+				if (max_val >= min_val) {
+					auto domain_span = static_cast<uint64_t>(max_val - min_val) + 1;
+					if (domain_span <= static_cast<uint64_t>(10000)) {
+						auto domain_distinct = LossyNumericCast<idx_t>(domain_span);
+						used_distinct = MaxValue<idx_t>(used_distinct, domain_distinct);
+					}
+				}
+			}
 			// we want the ceil of cardinality/column_count. We also want to avoid compiler errors
-			cardinality_after_filters = (cardinality + column_count - 1) / column_count;
+			cardinality_after_filters = (cardinality + used_distinct - 1) / used_distinct;
 		}
 		return cardinality_after_filters;
 	}

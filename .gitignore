@@ -139,6 +139,7 @@ tmp/
 *.jar
 scripts/PelotonTest/out
 scripts/PelotonTest/lib
+scripts/_join_cpp_backup/
 
 #==============================================================================#
 # Protobuf
@@ -294,9 +295,6 @@ cmake-build-debug
 cmake-build-release
 cmake-build-relwithdebinfo
 CMakeUserPresets.json
-
-# Generated documentation
-docs
 
 # tests
 test/test.sql

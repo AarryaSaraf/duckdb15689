@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 #pragma once
 
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/optimizer/join_order/query_graph.hpp"
 
@@ -17,13 +18,17 @@ namespace duckdb {
 class FilterInfo;
 
 struct DenomInfo {
-	DenomInfo(JoinRelationSet &numerator_relations, double filter_strength, double denominator)
-	    : numerator_relations(numerator_relations), filter_strength(filter_strength), denominator(denominator) {
+	DenomInfo(JoinRelationSet &numerator_relations, double filter_strength, double denominator,
+	          double unused_edge_multiplier = 1.0)
+	    : numerator_relations(numerator_relations), filter_strength(filter_strength), denominator(denominator),
+	      unused_edge_multiplier(unused_edge_multiplier) {
 	}
 
 	JoinRelationSet &numerator_relations;
 	double filter_strength;
 	double denominator;
+	//! Penalty factor (1 + #unused join edges) applied on top of the subgraph denominator.
+	double unused_edge_multiplier;
 };
 
 struct RelationsSetToStats {
@@ -87,6 +92,15 @@ public:
 	vector<string> column_names;
 };
 
+//! Stores per-relation table name and column names for SQL query construction.
+struct RelationColumnInfo {
+	string table_name;
+	vector<string> column_names;
+	//! SQL WHERE-clause fragment for scan-level predicates pushed down to this relation.
+	//! E.g. "i_manufact_id = 128 AND d_moy = 11". Empty if no pushed-down filters.
+	string scan_filter_string;
+};
+
 class CardinalityEstimator {
 public:
 	static constexpr double DEFAULT_SEMI_ANTI_SELECTIVITY = 5;
@@ -97,6 +111,10 @@ private:
 	unordered_map<string, CardinalityHelper> relation_set_2_cardinality;
 	JoinRelationSetManager set_manager;
 	vector<RelationStats> relation_stats;
+	//! Per-relation column info for SQL query construction (populated during init).
+	unordered_map<idx_t, RelationColumnInfo> relation_column_info;
+	//! All extracted filters (including residual predicates) for coverage checks.
+	vector<optional_ptr<FilterInfo>> all_filters;
 
 public:
 	void RemoveEmptyTotalDomains();
@@ -116,6 +134,10 @@ public:
 	void PrintRelationStats();
 
 private:
+	//! Cache key for relation_set_2_cardinality. Multi-relation sets also depend on
+	//! pending_left_split/pending_right_split so the same rel-set under different parents
+	//! does not incorrectly reuse an earlier estimate.
+	string MakeJoinSetCacheKey(const JoinRelationSet &new_set) const;
 	double GetNumerator(JoinRelationSet &set);
 	DenomInfo GetDenominator(JoinRelationSet &set);
 	optional_ptr<JoinRelationSet> pending_left_split;

@@ -48,6 +48,10 @@ struct RelationStats {
 	vector<string> column_names;
 	string table_name;
 
+	//! SQL WHERE-clause fragment for scan-level predicates (e.g. "i_manufact_id = 128 AND d_moy = 11").
+	//! Empty when there are no pushed-down scan filters.
+	string scan_filter_string;
+
 	RelationStats() : cardinality(1), filter_strength(1), stats_initialized(false) {
 	}
 };
@@ -55,6 +59,9 @@ struct RelationStats {
 class RelationStatisticsHelper {
 public:
 	static constexpr double DEFAULT_SELECTIVITY = 0.2;
+	//! When IS NULL is possible but we have no null fraction in stats, use this vs leaving cardinality unchanged
+	//! (which forces ExtractGetStats to apply DEFAULT_SELECTIVITY on the whole table — very wrong for rare nulls).
+	static constexpr double DEFAULT_IS_NULL_SELECTIVITY = 1.0 / 4096.0;
 
 public:
 	static idx_t InspectTableFilter(idx_t cardinality, idx_t column_index, const TableFilter &filter,

@@ -12,6 +12,57 @@
 
 namespace duckdb {
 
+static bool ExpressionTreeContainsIsNull(const Expression &expr) {
+	if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
+		return true;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COMPARISON) {
+		auto &cmp = expr.Cast<BoundComparisonExpression>();
+		if (cmp.GetExpressionType() == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			auto side_is_null_const = [](const unique_ptr<Expression> &side) {
+				return side && side->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+				       side->Cast<BoundConstantExpression>().value.IsNull();
+			};
+			if (side_is_null_const(cmp.left) || side_is_null_const(cmp.right)) {
+				return true;
+			}
+		}
+	}
+	bool found = false;
+	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
+		if (!found && ExpressionTreeContainsIsNull(child)) {
+			found = true;
+		}
+	});
+	return found;
+}
+
+static bool DatasourceFiltersContainIsNull(const vector<reference<LogicalOperator>> &datasource_filters) {
+	for (auto &filter_ref : datasource_filters) {
+		auto &op = filter_ref.get();
+		if (op.type != LogicalOperatorType::LOGICAL_FILTER) {
+			continue;
+		}
+		auto &lf = op.Cast<LogicalFilter>();
+		for (auto &expr : lf.expressions) {
+			if (ExpressionTreeContainsIsNull(*expr)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static double DatasourceFilterSelectivity(const vector<reference<LogicalOperator>> &datasource_filters) {
+	if (datasource_filters.empty()) {
+		return 1.0;
+	}
+	if (DatasourceFiltersContainIsNull(datasource_filters)) {
+		return RelationStatisticsHelper::DEFAULT_IS_NULL_SELECTIVITY;
+	}
+	return RelationStatisticsHelper::DEFAULT_SELECTIVITY;
+}
+
 const vector<RelationStats> RelationManager::GetRelationStats() {
 	vector<RelationStats> ret;
 	for (idx_t i = 0; i < relations.size(); i++) {
@@ -209,7 +260,7 @@ void RelationManager::AddRelationWithChildren(JoinOrderOptimizer &optimizer, Log
 	op.children[0] = child_optimizer.Optimize(std::move(op.children[0]), &child_stats);
 	if (!datasource_filters.empty()) {
 		child_stats.cardinality = LossyNumericCast<idx_t>(static_cast<double>(child_stats.cardinality) *
-		                                                  RelationStatisticsHelper::DEFAULT_SELECTIVITY);
+		                                                  DatasourceFilterSelectivity(datasource_filters));
 	}
 	ModifyStatsIfLimit(limit_op.get(), child_stats);
 	AddRelation(input_op, parent, child_stats);
@@ -224,7 +275,8 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 	// pass through single child operators
 	while (op->children.size() == 1 && !OperatorNeedsRelation(op->type)) {
 		if (op->type == LogicalOperatorType::LOGICAL_FILTER) {
-			if (HasNonReorderableChild(*op)) {
+			auto has_non_reorderable_child = HasNonReorderableChild(*op);
+			if (has_non_reorderable_child) {
 				datasource_filters.push_back(*op);
 			}
 			filter_operators.push_back(*op);
@@ -268,7 +320,7 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		op->SetEstimatedCardinality(combined_stats.cardinality);
 		if (!datasource_filters.empty()) {
 			combined_stats.cardinality = (idx_t)MaxValue(
-			    double(combined_stats.cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
+			    double(combined_stats.cardinality) * DatasourceFilterSelectivity(datasource_filters), (double)1);
 		}
 		AddRelation(input_op, parent, combined_stats);
 		return true;
@@ -286,7 +338,7 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		aggr.SetEstimatedCardinality(operator_stats.cardinality);
 		if (!datasource_filters.empty()) {
 			operator_stats.cardinality = LossyNumericCast<idx_t>(static_cast<double>(operator_stats.cardinality) *
-			                                                     RelationStatisticsHelper::DEFAULT_SELECTIVITY);
+			                                                     DatasourceFilterSelectivity(datasource_filters));
 		}
 		ModifyStatsIfLimit(limit_op.get(), child_stats);
 		AddAggregateOrWindowRelation(input_op, parent, operator_stats, op->type);
@@ -303,7 +355,7 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		window.SetEstimatedCardinality(operator_stats.cardinality);
 		if (!datasource_filters.empty()) {
 			operator_stats.cardinality = LossyNumericCast<idx_t>(static_cast<double>(operator_stats.cardinality) *
-			                                                     RelationStatisticsHelper::DEFAULT_SELECTIVITY);
+			                                                     DatasourceFilterSelectivity(datasource_filters));
 		}
 		ModifyStatsIfLimit(limit_op.get(), child_stats);
 		AddAggregateOrWindowRelation(input_op, parent, operator_stats, op->type);
@@ -383,8 +435,17 @@ bool RelationManager::ExtractJoinRelations(JoinOrderOptimizer &optimizer, Logica
 		// table scan, apply another selectivity.
 		get.SetEstimatedCardinality(stats.cardinality);
 		if (!datasource_filters.empty()) {
-			stats.cardinality =
-			    (idx_t)MaxValue(double(stats.cardinality) * RelationStatisticsHelper::DEFAULT_SELECTIVITY, (double)1);
+			stats.cardinality = (idx_t)MaxValue(double(stats.cardinality) * DatasourceFilterSelectivity(datasource_filters),
+			                                    (double)1);
+			for (auto &filter_ref : datasource_filters) {
+				auto &filter_op = filter_ref.get().Cast<LogicalFilter>();
+				for (auto &expr : filter_op.expressions) {
+					if (!stats.scan_filter_string.empty()) {
+						stats.scan_filter_string += " AND ";
+					}
+					stats.scan_filter_string += expr->ToString();
+				}
+			}
 		}
 		ModifyStatsIfLimit(limit_op.get(), stats);
 		AddRelation(input_op, parent, stats);
@@ -662,7 +723,6 @@ vector<unique_ptr<FilterInfo>> RelationManager::ExtractEdges(LogicalOperator &op
 						expr = cond.GetJoinExpression().Copy();
 						is_residual = true;
 					}
-
 					if (filter_set.find(*expr) == filter_set.end()) {
 						filter_set.insert(*expr);
 						unordered_set<idx_t> bindings;
@@ -686,7 +746,13 @@ vector<unique_ptr<FilterInfo>> RelationManager::ExtractEdges(LogicalOperator &op
 					ExtractBindings(*expression, bindings);
 					if (bindings.empty()) {
 						// the filter is on a column that is not in our relational map. (example: limit_rownum)
-						// in this case we do not create a FilterInfo for it. (duckdb-internal/#1493)s
+						// keep a residual marker so downstream cardinality estimation can conservatively avoid
+						// constructing partial SQL_COUNT_QUERY targets that would miss this predicate.
+						auto &empty_set = set_manager.GetJoinRelation(bindings);
+						auto unknown_filter_info =
+						    make_uniq<FilterInfo>(expression->Copy(), empty_set, filters_and_bindings.size());
+						unknown_filter_info->from_residual_predicate = true;
+						filters_and_bindings.push_back(std::move(unknown_filter_info));
 						leftover_expressions.push_back(std::move(expression));
 						continue;
 					}
