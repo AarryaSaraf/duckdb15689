@@ -61,8 +61,8 @@ flowchart LR
     C --> E[extract_join_nodes]
     D --> F[match_joins]
     E --> F
-    F --> G[Safety gates]
-    G --> H[update_actual_cardinality.json]
+    F --> G[Safety gates + purge]
+    G --> H[update_actual_cardinality_json]
   end
   subgraph iter2 [Iteration 2]
     H --> I[Same query again]
@@ -73,29 +73,31 @@ flowchart LR
 ```
 
 1. **`child_duckdb_env`** sets **`DUCKDB_ACTUAL_CARDINALITY_JSON`** and **`DUCKDB_CARDINALITY_LOG`** so the C++ estimator reads/writes the same paths as Python (`feedback_benchmark.py`).
-2. **`run_query_with_json_profile`** wraps your SQL with **`PRAGMA enable_profiling = 'json'`** and runs **`duckdb /path/to/tpcds_sf10.db -c '…'`**.
-3. **`parse_cardinality_log`** turns each **`LOGICAL_JOIN`** record into a structured **`log_entries`** row (`expression`, `filters`, `tables`, `cardinality`, …).
-4. **`extract_join_nodes`** walks the profile tree and collects **`HASH_JOIN`** / **`NESTED_LOOP_JOIN`** / … nodes with **`Conditions`**, **`Estimated Cardinality`**, **`Cardinality`** (actual).
-5. **`match_joins`** pairs profile joins to log lines (predicates + table sets; **`used_log_indices`** prevents two physical joins from stealing the same log line).
+2. **`run_query_with_json_profile`** wraps your SQL with **`PRAGMA enable_profiling = 'json'`** and runs **`duckdb /path/to/tpcds_sf10.db -c '…'`**. It can optionally set **`DUCKDB_FEEDBACK_PLAN_FINGERPRINT`** when called with a non-`None` fingerprint hint; **`run_single_query`** uses **`plan_fingerprint_hint=None`**, so the default benchmark loop does not namespace keys that way.
+3. **`parse_cardinality_log`** turns each **`LOGICAL_JOIN`** record into a structured **`log_entries`** row (`expression`, `filters`, `tables`, `cardinality`, `is_injected`, …).
+4. **`extract_join_nodes`** walks the profile tree and collects join operators (see **`JOIN_OPERATOR_NAMES`** in the script) with **`Conditions`**, **`Estimated Cardinality`**, measured cardinality, **`descendant_tables`**, **`subtree_operator_signatures`** (for the dynamic-filter guard), **`plan_path`**, and other fields used by matching and verification.
+5. **`match_joins`** (built on **`precompute_join_match_caches`** + **`match_single_profile_join`**) pairs profile joins to log lines (predicates + table sets; **`used_log_indices`** prevents two physical joins from stealing the same log line).
 
----
+**Scope:** The walkthrough below is one **`run_single_query`** call (one query number). The full benchmark’s **`main()`** also clears **`actual_cardinality.json`** and the log **after** each query finishes so the next query does not inherit another query’s keys.
 
 ## 3. What the first subprocess run does
 
 ### 3.1 SQL actually executed
 
-Conceptually (see ```355:361:feedback_benchmark.py```):
+Conceptually (see ```280:286:feedback_benchmark.py```):
 
 ```text
 PRAGMA enable_profiling = 'json';
 PRAGMA profiling_mode = 'detailed';
-PRAGMA profiling_output = '<repo>/profile_output.json';
+PRAGMA profiling_output = '<REPO_ROOT>/profile_output.json';
 PRAGMA enable_progress_bar = false;
 <your TPC-DS Q6 text>
 ```
 
+The profiling output path is the constant **`PROFILE_OUTPUT`** (by default **`profile_output.json`** next to **`feedback_benchmark.py`** in the repo root).
+
 - **Planning** appends to **`cardinality_log.txt`** (via **`DUCKDB_CARDINALITY_LOG`**).
-- **Execution** writes a **JSON** profile, which Python loads and then **deletes** the file (transient `profile_output.json`).
+- **Execution** writes a **JSON** profile, which Python loads and then **deletes** the file (transient profile on disk).
 
 ### 3.2 What shows up in `cardinality_log.txt`
 
@@ -108,7 +110,7 @@ For Q6 at SF10 on the setup above, **`parse_cardinality_log`** reported **48** s
 
 ### 3.3 What shows up in the JSON profile
 
-`extract_join_nodes` walks the profile tree and reads **`operator_cardinality`** on each join-like operator (see ```517:525:feedback_benchmark.py```). For Q6 on this SF10 database, the eight tracked joins looked like this (abbreviated conditions):
+`extract_join_nodes` walks the profile tree and reads **`operator_cardinality`** (and related **`extra_info`**) on each join-like operator (see ```375:432:feedback_benchmark.py```). For Q6 on this SF10 database, the eight tracked joins looked like this (abbreviated conditions):
 
 | Operator | Condition (trimmed) | Est. rows | Actual rows |
 |----------|---------------------|-----------|--------------|
@@ -133,7 +135,7 @@ When **`run_single_query(6, sql)`** ran on this machine:
 - **48** parsed log entries.
 - **`match_joins`** produced **2** matches.
 
-The script printed **new JSON entries** as **`[NEW] LOGICAL_JOIN: … -> <actual>`** (implementation detail of **`update_actual_cardinality_json`** when keys are first written).
+The script printed **new JSON entries** as **`[NEW] <full LOGICAL_JOIN line> -> <actual>`** (see **`update_actual_cardinality_json`**: the **`[NEW]`** line prints the raw **`expression`** string followed by **`->`** and the integer cardinality).
 
 Those two correspond to:
 
@@ -162,7 +164,7 @@ Open **`actual_cardinality.json`** locally—the keys are long single-line strin
 
 ## 5. Iteration 2 — injection shows up in the log
 
-Before iteration 2, **`clear_cardinality_log()`** truncates the log, but **`actual_cardinality.json` is not cleared**—it **accumulates** so the next planning phase can load injections.
+At the **start** of **`run_single_query`**, the benchmark **deletes** **`actual_cardinality.json`** and truncates **`cardinality_log.txt`** so each query begins with a clean slate. **Within** the per-query loop, **`clear_cardinality_log()`** runs again at the beginning of **each** iteration, while **`actual_cardinality.json`** is **not** cleared between iterations—it **accumulates** (after quarantine / CTE skips) so the next planning phase can load injections.
 
 On the **second** planning pass for Q6, **`cardinality_estimator.cpp`** finds matching **`LOGICAL_JOIN`** expression strings in JSON and emits:
 
@@ -179,13 +181,11 @@ So you can **grep** the fresh **`cardinality_log.txt`** for **`using INJECTED Ca
 
 ## 6. Verification (`verify_injection`)
 
-Starting at iteration 2, **`verify_injection`** runs checks such as (names paraphrased from printed output):
+Starting at iteration 2, **`verify_injection`** runs **`verify_check_1`** … **`verify_check_7`** (injected vs pre-update JSON, JSON keys present in the log, previously known matches showing **`INJECTED`**, injected vs measured profile cardinalities, distinct **`log_index`** bindings / duplicate-expression commentary, join coverage, and **ambiguous-candidate** reporting).
 
-- Injected values from the **previous** JSON snapshot appear in the **new** log as **`INJECTED`**.
-- JSON keys still correspond to real **`LOGICAL_JOIN`** lines.
-- Measured cardinalities still align with the profile for injected joins.
+On this Q6 run, the printed checks **passed** (aside from any informational **`[INFO]`** lines), and the **plan structure text** matched between iterations with no pending JSON updates (`changes_made=False`) → **converged** in **2** iterations.
 
-On this Q6 run, all checks **passed**, and the **plan structure text** matched between iterations → **converged** in **2** iterations.
+**Note:** **`run_single_query`** always prints **`Verification passed.`** after **`verify_injection`** returns, even when individual checks emitted **`WARN`** lines—read the **`[VERIFY]`** block above that line for the real status.
 
 ---
 
@@ -206,6 +206,8 @@ So **“simple SQL” ≠ “simple feedback.”** Parallel pipelines and dynami
 cd /path/to/duckdb15689
 export DUCKDB_FEEDBACK_DB=/path/to/tpcds_sf10.db
 export DUCKDB_FEEDBACK_SF=10
+# Optional: subprocess timeout for each profile run (seconds)
+# export DUCKDB_BENCHMARK_MAIN_QUERY_TIMEOUT_SEC=600
 
 # Optional: only Q6 via a tiny driver
 python3 -c "
@@ -232,7 +234,7 @@ Inspect:
 | **Many log lines, few matches** | 48 logical estimates vs 8 physical joins vs **2** safe matches. |
 | **Injection key** | The entire **`LOGICAL_JOIN:`** line text — not a short alias. |
 | **Success signal** | **`using INJECTED Cardinality`** in **`cardinality_log.txt`** and **`[VERIFY] Check 3`** passing. |
-| **Convergence** | Same **plan structure text** on successive iterations after writes stabilize. |
+| **Convergence** | Same **plan structure text** on successive iterations AND **no JSON updates pending** (`changes_made=False`), **or** the loop stops early on **plan oscillation**. |
 | **Not every query injects** | Q3 can finish with **0** injections despite a smaller-looking SQL text. |
 
 ---

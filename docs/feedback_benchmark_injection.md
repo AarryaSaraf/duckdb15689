@@ -14,10 +14,10 @@ For an **end-to-end worked example** (TPC-DS Q6, SF10: profiling, log lines, mat
 | Term                                | Plain meaning                                                                                                                                                                                            |
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Logical join / join-order phase** | Before execution, the optimizer picks join order and **estimates** how many rows each join will produce. That work runs in C++ (`join_order` / `cardinality_estimator`).                                 |
-| `**cardinality_log.txt`**           | Text log produced during planning: blocks like `LOGICAL_JOIN: ... Filters: ... Estimated Cardinality: N`. Each block has a long `**expression**` string (the full line) used as a **key** for injection. |
+| **`cardinality_log.txt`**          | Text log produced during planning: blocks like `LOGICAL_JOIN: ... Filters: ... Estimated Cardinality: N`. Each block has a long **`expression`** string (the full line) used as a **key** for injection. |
 | **Physical join (profile)**         | What actually runs: `HASH_JOIN`, `NESTED_LOOP_JOIN`, etc., with **measured** output cardinality from the JSON execution profile.                                                                         |
-| `**match_joins`**                   | Python function that tries to pair **each profile join** with **one** log line, using normalized join conditions + table sets.                                                                           |
-| `**actual_cardinality.json`**       | Mapping `{ expression_string → integer rows }`. The engine reads this on a later run to **inject** cardinalities during estimation (same hook as oracle).                                                |
+| **`match_joins`**                   | Python orchestrator: precomputes normalized predicate sets, then calls **`match_single_profile_join`** once per physical join to pair it with **at most one** log line (exclusive `used_log_indices`).   |
+| **`actual_cardinality.json`**      | Mapping `{ expression_string → integer rows }`. The engine reads this on a later run to **inject** cardinalities during estimation (same hook as oracle).                                                |
 | **Injection**                       | Overriding the optimizer’s estimate with a stored integer for that expression key.                                                                                                                       |
 
 
@@ -76,51 +76,53 @@ So an “estimated join” in the log corresponds to **one visit** to `EstimateC
 | `DUCKDB_FEEDBACK_SF`          | Integer scale factor label (printed in the banner only; must match the DB you point at).                      |
 | `DUCKDB_FEEDBACK_MAX_QUERIES` | If set (e.g. `5`), only queries **Q1–Qn** run — useful for smoke tests; omit for full **99-query** benchmark. |
 | (bundled SQL)                 | TPC-DS text is read from `feedback_queries/tpcds/qNN.sql`; regenerate with `python3 scripts/export_tpcds_query_files.py`. |
+| `DUCKDB_BENCHMARK_MAIN_QUERY_TIMEOUT_SEC` | Optional per-query subprocess timeout in seconds (default **600**). |
 
 
-After a full run, `**GLOBAL TOTALS`** prints summed iterations, plan-change events, last-iteration injected log lines across queries, etc., so two identical configs can be compared without manual tallying.
+After a full run, **`GLOBAL TOTALS`** prints summed iterations, plan-change events, last-iteration injected log lines across queries, converged / oscillation / error counts, etc., so two identical configs can be compared without manual tallying.
 
 Per iteration:
 
 1. **Execute** the query with **JSON profiling** → list of **physical** join operators and **actual** row counts (`extract_join_nodes` / profile parsing).
-2. **Parse** `cardinality_log.txt` → list of `**LOGICAL_JOIN`** entries (expression string, filters, tables, estimated cardinality, etc.).
-3. `**match_joins**` → for each physical join with usable conditions, pick **at most one** log line (see §3).
-4. **Safety gates** in `run_single_query` → may mark matches **unsafe** (ambiguous, collisions, dynamic filters, drift, …).
-5. `**update_actual_cardinality_json`** → append/update `{ expression → actual_cardinality }` for **safe** matches only.
+2. **Parse** `cardinality_log.txt` → list of **`LOGICAL_JOIN`** entries (expression string, filters, tables, estimated cardinality, etc.).
+3. **`match_joins`** (via **`match_single_profile_join`**) → for each physical join with **non-empty** normalized conditions, pick **at most one** log line (see §3).
+4. **`collect_quarantine_unsafe_expressions`** (and **`purge_unsafe_expressions_from_json`**) → may mark matches **unsafe** (ambiguous candidates, same-key actual collisions, dynamic filters, cross-iteration drift, …); quarantined keys are removed from JSON so later iterations cannot inject them.
+5. **`update_actual_cardinality_json`** → append/update `{ expression → actual_cardinality }` for matches that survived quarantine (and are not CTE-duplicate expressions in the log).
 6. Next iteration: the engine reads JSON during optimization and applies **injected** cardinalities when it recognizes the same expression key.
 
-If step 3 or 4 fails for a join, that feedback is **not** written (or is later **purged** from JSON).
+If matching or quarantine blocks a join, that feedback is **not** written (or is later **purged** from JSON). From iteration 2 onward, **`verify_injection`** runs checks 1–7 (warnings vs passes) against the JSON snapshot **before** that iteration’s updates.
+
+**Per-query startup:** **`run_single_query`** deletes **`actual_cardinality.json`** and truncates **`cardinality_log.txt`** once at the beginning of that query’s loop, then truncates **only** the log at the start of **each** iteration so planning output stays per-iteration while JSON accumulates (subject to quarantine). The full **`main()`** driver clears both files again after each query so the next TPC-DS query starts cold.
 
 ---
 
-## 3. How `match_joins` works (step-by-step)
+## 3. How matching works (`precompute_join_match_caches`, `match_joins`, `match_single_profile_join`)
 
 This section answers “what is the code actually doing?” for a new reviewer.
 
 **Inputs:** `profile_joins` (physical operators), `log_entries` (parsed `LOGICAL_JOIN` lines).
 
-**Preparation:**
+**Preparation — `precompute_join_match_caches`:**
 
-- For each profile join, normalize its **conditions** string into `pnorm` (a `frozenset` of normalized predicates).
-- For each log entry, normalize `**filters`** into `lnorm` and record `**tables**`.
+- For each profile join, parse **`conditions`**, **`normalize_condition_set`**, drop tautological normalized pieces via **`_is_tautology_condition`**, and store **`pnorm`** (a `frozenset` of normalized predicates).
+- For each log entry, normalize **`filters`** the same way into **`lnorm`**, and record **`tables`**.
 
-**Main loop — one iteration per profile join** (`pidx`):
+**Main loop — `match_joins` calls `match_single_profile_join` once per profile index `pidx`:**
 
-1. **Skip if `pnorm` is empty** (`continue` at lines 937–938).
-  - Example: cross product, or conditions not exposed in the profile text the parser sees.  
-  - Result: this physical join **never** enters `matches` → may land in `unresolved` if nothing else saves it.
-2. **Consider each log line `lidx`** unless `lidx` is in `**used_log_indices**` (lines 958–960).
-  - **Critical:** after a log line wins for **some** profile join, that `**lidx` is reserved** — no other profile join may claim it.  
-  - So **two different physical joins cannot both match the same log index.** (If they did, that would be a bug; the benchmark has **Check 5** to warn about duplicate `log_index`.)
-3. **Predicate / table compatibility:**
-  - If `**lineage_incomplete`**: allow `pnorm ⊆ lnorm` or equality (subset matching).
-  - Else: require `**lnorm == pnorm**` (exact equality of normalized sets).
-  - Table check: descendant tables from the profile must align with the log’s table set (exact or subset rules depending on lineage).
-4. **Count candidates:** every log line that passes the filters increments `**candidate_count`** (line 992).
-5. **Pick a winner** among candidates with a **staged** priority (exact tables + exact conditions first, then weaker matches) and **tie-breakers** (estimated cardinality closeness, lexicographic expression order, etc.) — lines 984–1047.
-6. **Append a match** with fields including `**expression`** = full string from `log_entries[best_lidx]`, `**actual_cardinality**` from **this** physical join’s measured rows, and `**candidate_count`**.
+1. **Empty `pnorm`** — `match_single_profile_join` returns `(None, None)` immediately (```835:836:feedback_benchmark.py```).
+   - Example: cross product, or conditions not exposed in the profile text the parser sees.
+   - Result: this physical join is **not** added to `matches` and **not** listed in `unresolved` (it is skipped silently).
+2. **Consider each log line `lidx`** unless `lidx` is in **`used_log_indices`** (```853:855:feedback_benchmark.py```).
+   - **Critical:** after a log line wins for **some** profile join, that **`lidx` is reserved** — no other profile join may claim it.
+   - **Check 5** in **`verify_check_5_distinct_log_bindings`** warns if the same `log_index` appears twice in `matches` (would indicate a matcher bug).
+3. **Predicate / table compatibility** — **`_log_candidate_context_ok`** (```756:766:feedback_benchmark.py```):
+   - If **`lineage_incomplete`**: allow `lnorm == pnorm` or `pnorm ⊆ lnorm`, with an intersection check on table names when lineage is incomplete.
+   - Else: require **`lnorm == pnorm`** and **`l_tables == p_desc_tables`** (exact table set match).
+4. **Count candidates:** every log line that passes the gates increments **`candidate_count`** (```863:864:feedback_benchmark.py```).
+5. **Pick a winner** — **`_join_match_stage`** assigns a discrete **stage** 0–3 (exact conditions+tables down to weakest), then **`_candidate_beats_best`** tie-breaks (optionally distance to profile **estimated** cardinality, then stage, table delta, condition delta, lexicographic expression).
+6. **On success**, return a match dict with **`expression`**, **`log_index`**, **`actual_cardinality`**, **`candidate_count`**, **`selected_stage`**, etc. **If no log line wins**, return **`(None, unresolved_dict)`** so the join is recorded as **unresolved**.
 
-**Outputs:** `matches` and `unresolved` (physical joins that had conditions but **no** winning log line).
+**Outputs:** `matches` and `unresolved` (only joins that had **non-empty** normalized conditions but **no** winning unused log line).
 
 ---
 
@@ -150,26 +152,26 @@ Below, “log line” = one parsed `LOGICAL_JOIN` record in memory (same idea as
 
 **Scenario A — cross product then filter**
 
-The **optimizer** may still log a selective join for `{A,B}` with predicates. The **executor** might implement “join” as **nested loop with empty join conjuncts** in the profile and push predicates into a **Filter** **above** the join (depending on plan). Then the profile join row’s `**conditions`** field can be **empty** after parsing → `**pnorm`** is empty → **skipped at 937–938** before any log comparison.
+The **optimizer** may still log a selective join for `{A,B}` with predicates. The **executor** might implement “join” as **nested loop with empty join conjuncts** in the profile and push predicates into a **Filter** **above** the join (depending on plan). Then the profile join row’s **`conditions`** field can be **empty** after parsing → **`pnorm`** is empty → **skipped at 835–836** before any log comparison.
 
-```937:938:feedback_benchmark.py
-        if not pnorm:
-            continue  # No conditions (e.g., cross product)
+```835:836:feedback_benchmark.py
+    if not pnorm:
+        return None, None
 ```
 
 
 | Stage                | What you see                                                                                                                                      |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **SQL (conceptual)** | Still `A JOIN B ON …`, but explain JSON shows a cross-type join with **no** conjuncts on the operator.                                            |
-| **Profile join**     | `conditions: ""` → `pnorm` empty → **ignored** by matcher.                                                                                        |
+| **Profile join**     | `conditions: ""` → `pnorm` empty → **ignored** by matcher (`(None, None)`).                                                                       |
 | **Log**              | Still has a rich `LOGICAL_JOIN` for `A⋈B`.                                                                                                        |
-| **Ambiguity**        | There is no ambiguity—this physical row is **ineligible** for text-based matching.                                                                |
-| **Outcome**          | `unresolved` (lines 1174–1183). **Nothing** to inject for this operator until profiling exposes comparable predicates or the matcher is extended. |
+| **Ambiguity**        | There is no ambiguity—this physical row is **ineligible** for text-based matching.                                                                  |
+| **Outcome**          | **Not** appended to `unresolved` (no diagnostic row for empty `pnorm`). **Nothing** to inject until profiling exposes comparable predicates or the matcher is extended. |
 
 
 **Scenario B — string normalization mismatch**
 
-The log might say `CAST(x AS INT) = y` while the profile says `x = y` after different formatting. If `**normalize_condition_set`** does not map them to the same canonical form, `**lnorm != pnorm**` and no match occurs—again `**unresolved**`, not “ambiguous.”
+The log might say `CAST(x AS INT) = y` while the profile says `x = y` after different formatting. If **`normalize_condition_set`** does not map them to the same canonical form, **`lnorm != pnorm`** and no match occurs—again **`unresolved`**, not “ambiguous.”
 
 **Why this is strict:** injecting from the wrong log line would silently poison cardinality for an unrelated join; empty or mismatched predicates are treated as **unknown**, not guessed.
 
@@ -179,93 +181,23 @@ The log might say `CAST(x AS INT) = y` while the profile says `x = y` after diff
 
 **Scenario — same predicates, different *estimator context***
 
-The join-order search may visit **the same join predicate** in **multiple DP contexts** (different input cardinalities / relation bindings / context occurrence). The **full `expression` string** often differs (e.g. different `CtxInputCards`, `CtxOcc`, `RelSets` embedding), but **after normalization** two log lines can still both satisfy:
+The join-order search may visit **the same join predicate** in **multiple DP contexts**. Historically, this caused identical `expression` strings. We have since added **`CtxScanFilters`** and **`CtxOcc`** to the C++ log output to make these signatures as unique as possible. 
 
-- `lnorm == pnorm` (same normalized filters), and  
-- the same **descendant table set** check.
+However, ambiguity still occurs when a query contains multiple subqueries that are *identical* down to their scan filters (e.g., Q88). Because the physical nodes in Iteration 1 all share the same vanilla estimated cardinality, the Python matcher cannot distinguish them and must **guess** the mapping.
 
-Then `**candidate_count == 2`** (or more). The matcher **still picks one winner** (tie-breakers), but `**run_single_query` refuses to inject** because the tie-breaker is a **heuristic**, not a proof of identity:
-
-```2171:2178:feedback_benchmark.py
-        # Strict safety gate: never inject ambiguous matches or conflicting
-        # same-key cardinalities (beyond tolerated tiny drift).
-        newly_unsafe = set()
-        for m in matches:
-            if int(m.get("candidate_count", 0)) > 1:
-                expr = m["expression"]
-                print(f"    [ALARM-AMBIGUOUS-MATCH] {expr}")
-                newly_unsafe.add(expr)
-```
-
-
-| Stage                        | What you see                                                                                                                  |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| **One physical `HASH_JOIN`** | `actual_cardinality = 50_000`.                                                                                                |
-| **Log**                      | Two lines both normalize to the same filter set and pass table checks, but differ elsewhere in the long expression (context). |
-| **Matcher**                  | Picks one line (e.g. closer to profile estimated cardinality).                                                                |
-| **Safety**                   | `candidate_count > 1` → **quarantine** — **do not trust** injection for that key.                                             |
-
-
-**Why it happens:** the **logical identity** in the log is **not unique** when you only look at normalized predicates + table sets; the estimator needed **two** rows for **two planning contexts**, but the physical operator only corresponds to **one** of them—without extra disambiguation (RelSets match, plan path, manual map), Python cannot know which row is “the” one.
+**The Fix:** 
+In Iteration 2, DuckDB injects the guessed cardinalities. The physical nodes now have *unique* estimated cardinalities, allowing the Python script to perfectly match them. Although correcting the guess causes a massive cardinality drift, the script recognizes that the previous match was a "vanilla guess" (`is_injected=False`) and safely bypasses the drift quarantine (see Flow G). Thus, Flow C ambiguity is now a temporary, **self-correcting** state!
 
 ---
 
 ### Flow D — same expression key, conflicting actual cardinalities (batch collision)
 
-This is the flow that feels **counter-intuitive**. Two physical joins produced **different measured row counts**, yet both matched log entries whose `**expression`** string is **byte-identical**. Then `actual_cardinality.json` cannot store both facts under one key.
+This flow described the issue where two physical joins produced **different measured row counts**, yet both matched log entries whose **`expression`** string was **byte-identical**. Then `actual_cardinality.json` could not store both facts under one key.
 
-#### We are **not** missing physics — we are missing a **unique key**
+**The Fix (`CtxOcc`):** 
+We added **`CtxOcc: N`** to the end of every `LOGICAL_JOIN` line in the C++ optimizer. This tracks the specific *occurrence* or visit index of the estimator for a given logic. Because the estimator always increments this counter, no two `LOGICAL_JOIN` blocks will ever produce byte-identical strings within the same query execution, even for `UNION ALL` branches.
 
-Recall `**used_log_indices`** (§3): **two profile joins cannot consume the same `log_index`.** So this is **not** “two operators stole the same log line.”
-
-What **can** happen is:
-
-1. `**parse_cardinality_log`** produces **two entries** `log_entries[0]` and `log_entries[1]` with **different** `log_index` but `**expression` text exactly the same string**.
-2. Physical join **Alpha** matches line **0** → `(expression E, actual 1_000)`.
-3. Physical join **Beta** cannot take line **0** (used); matches line **1** → `(expression E, actual 50_000)`.
-4. `**update_actual_cardinality_json`** conceptually needs `E → 1000` and `E → 50000` at once—**impossible** for a single JSON map.
-
-The benchmark authors already documented that duplicate expression strings across **distinct** log lines are **expected** in some cases:
-
-```1713:1728:feedback_benchmark.py
-    # ----- Check 5: Each match must bind to a distinct cardinality-log line -----
-    # The same LOGICAL_JOIN text may appear on multiple log lines (e.g. UNION); those
-    # are different entries (different log_index). Duplicate expression strings are OK;
-    # reusing the same log line for two physical joins is not.
-    log_indices = [m["log_index"] for m in matches]
-    ...
-    if dup_exprs:
-        print(f"    [VERIFY] Check 5 PASSED: {len(matches)} mappings; {len(dup_exprs)} "
-              f"expression string(s) repeated across distinct log line(s) (OK).")
-```
-
-So **duplicate keys are “OK” for matching** (two branches can bind to two log lines), but they are **not OK for JSON** if the **measured** cardinalities **disagree**: you cannot store two values under one string.
-
-#### Concrete story
-
-Imagine a query shaped like `**UNION ALL` of two similar report queries**, each with `**stores ⋈ customers ON s.id = c.store_id`**. The estimator runs **twice** (once per branch) and emits **two** `LOGICAL_JOIN` blocks. If the serializer prints **identical** full lines (same RelSets/filters string—example only), you get **two** `log_entries` with the **same** `expression`. At execution time:
-
-- Branch 1’s hash join outputs **1_000** rows.  
-- Branch 2’s hash join outputs **80_000** rows (different data slice).
-
-Both matches are **legitimate** (different `log_index`, different physical operators), but `**expression` collides** → `**ALARM-CONTEXT-COLLISION`** when building the batch.
-
-```2179:2189:feedback_benchmark.py
-        batch_actuals = {}
-        for m in matches:
-            batch_actuals.setdefault(m["expression"], set()).add(
-                int(m.get("actual_cardinality", 0))
-            )
-        for expr, vals in batch_actuals.items():
-            if len(vals) > 1:
-                print(
-                    f"    [ALARM-CONTEXT-COLLISION] same key has conflicting actuals in batch: "
-                    f"{sorted(list(vals))} -- {expr}"
-                )
-                newly_unsafe.add(expr)
-```
-
-**What we’re “missing” for a fix:** not a deeper understanding of SQL—a **unique injection key** per planner occurrence (e.g. stable join id + occurrence index in the log), or **namespacing** that always distinguishes branches so JSON keys never collide when actuals differ.
+As a result, Flow D batch collisions have been **effectively eliminated**. The Python script's `[ALARM-CONTEXT-COLLISION]` logic remains in place solely as a safeguard against unforeseen logging bugs.
 
 ---
 
@@ -273,33 +205,10 @@ Both matches are **legitimate** (different `log_index`, different physical opera
 
 **What `detect_cte_duplicates` does**
 
-After parsing `cardinality_log.txt` into `log_entries`, the benchmark counts how many times each full `**expression`** string appears:
+Historically, the estimator would plan a CTE multiple times, repeating **identical** `LOGICAL_JOIN` lines. The benchmark script counted how many times each full **`expression`** string appeared, and skipped injecting any strings that appeared >1 time (`[SKIP-CTE]`).
 
-```1192:1201:feedback_benchmark.py
-def detect_cte_duplicates(log_entries):
-    """
-    Detect expressions that appear more than once in the cardinality log.
-    These are likely CTEs that are planned once but executed multiple times.
-    ...
-    """
-    expr_counts = Counter(entry["expression"] for entry in log_entries)
-    return {expr for expr, count in expr_counts.items() if count > 1}
-```
-
-Any expression in that **duplicate set** is treated as **unsafe to inject by text alone**: the same key might refer to **multiple** estimator occurrences (CTE inlined several times, duplicate enumeration of the same subgraph, etc.). `**update_actual_cardinality_json`** skips them (`[SKIP-CTE]`).
-
-**Concrete mini-scenario**
-
-
-| Stage                       | Content                                                                                                                               |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| **SQL**                     | Query defines `WITH cte AS (SELECT … FROM big_fact JOIN dim ON …) SELECT * FROM cte UNION ALL SELECT * FROM cte …`                    |
-| **Planner**                 | May estimate the join inside `cte` **multiple times** as it explores branches; the log can repeat **identical** `LOGICAL_JOIN` lines. |
-| `**detect_cte_duplicates`** | Returns that expression string — appears **≥ 2** times in one parse of the file.                                                      |
-| **Injection write**         | Skipped: writing **one** cardinality would be meaningless or wrong for the “other” occurrence(s).                                     |
-
-
-This is **related but not identical** to Flow D: Flow D is “duplicate keys matched to **different actual cardinalities** this iteration”; Flow E is “duplicate keys seen **in the log parse** before matching,” used as a cheap **quarantine** heuristic.
+**The Fix (`CtxOcc`):**
+Just like with Flow D, the introduction of **`CtxOcc: N`** assigns a unique occurrence index to the `LOGICAL_JOIN` string. As a result, `detect_cte_duplicates` will virtually never see the exact same expression string more than once. The quarantine heuristic remains in place as a safeguard, but is largely dormant.
 
 ---
 
@@ -311,20 +220,20 @@ Parallel pipelines sometimes install **dynamic filters** (bloom / min-max pushed
 
 **What the benchmark checks**
 
-For each match, it extracts column-like tokens from the profile join’s `**conditions`** string (`extract_condition_columns`) and scans `**subtree_operator_signatures**` for `Dynamic Filters=` optional columns (`extract_dynamic_filter_columns`). If **any** dynamic column is **not** among the join condition columns, the expression is marked unsafe:
+For each match, it extracts column-like tokens from the profile join’s **`conditions`** string (`extract_condition_columns`) and scans **`subtree_operator_signatures`** for `Dynamic Filters=` optional columns (`extract_dynamic_filter_columns`). If **any** dynamic column is **not** among the join condition columns, the expression is marked unsafe:
 
-```2206:2224:feedback_benchmark.py
-        # Dynamic-filter guard: if a matched subtree scan has dynamic filter columns
-        # outside this join's own condition columns, treat key as context-unsafe.
-        for m in matches:
-            ...
-            extra_dyn_cols = sorted([c for c in dyn_cols if c not in cond_cols])
-            if extra_dyn_cols:
-                print(
-                    f"    [ALARM-DYNAMIC-FILTER-CONTEXT] dynamic filter cols outside join "
-                    ...
-                )
-                newly_unsafe.add(expr)
+```1410:1431:feedback_benchmark.py
+def _quarantine_dynamic_filter_context(matches, profile_joins):
+    """Subtree dynamic-filter columns outside join condition columns → unsafe key."""
+    ...
+        extra_dyn_cols = sorted([c for c in dyn_cols if c not in cond_cols])
+        if not extra_dyn_cols:
+            continue
+        print(
+            f"    [ALARM-DYNAMIC-FILTER-CONTEXT] dynamic filter cols outside join "
+            f"condition: {extra_dyn_cols} -- {expr}"
+        )
+        out.add(expr)
 ```
 
 **Concrete mini-scenario**
@@ -334,7 +243,7 @@ For each match, it extracts column-like tokens from the profile join’s `**cond
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Physical join**    | `HASH_JOIN` conditions list only `ss_store_sk = s_store_sk`.                                                                                               |
 | **Subtree**          | A probe-side scan shows `Dynamic Filters= optional:d_date_sk ...` from another pipeline.                                                                   |
-| `**extra_dyn_cols`** | Contains `d_date_sk` (not in join conjuncts).                                                                                                              |
+| **`extra_dyn_cols`** | Contains `d_date_sk` (not in join conjuncts).                                                                                                              |
 | **Outcome**          | `[ALARM-DYNAMIC-FILTER-CONTEXT]` → expression quarantined: we refuse to treat the logical join key as sufficient context for the **measured** cardinality. |
 
 
@@ -342,34 +251,36 @@ For each match, it extracts column-like tokens from the profile join’s `**cond
 
 ---
 
-### Flow G — plan-stable drift across iterations
+### Flow G — cross-iteration cardinality drift (history)
 
 **Setup**
 
-`expr_match_history` records, per expression key, each iteration’s matched actual cardinality and plan fingerprint. When the **plan structure text** matches the **previous** iteration (`plan_stable`), we expect relatively stable measurements for the **same** physical mapping.
+`_record_match_history` appends, per matched **`expression`**, one record per iteration (actual cardinality, plan fingerprint, profile join index, subtree signatures, **`candidate_count`**, etc.) into **`expr_match_history`**.
 
-**Drift detection**
+**Drift detection — `_quarantine_cross_iteration_cardinality_drift`**
 
-If the **previous** and **current** actual cardinalities for the same expression differ by more than **both** `STABLE_PLAN_ABS_DRIFT_TOLERANCE` (absolute rows) **and** `STABLE_PLAN_REL_DRIFT_TOLERANCE` (relative), the key is treated as colliding across iterations (`[ALARM-CONTEXT-COLLISION]` with cross-iteration messaging, lines ~2246–2307).
+For each expression with **at least two** history entries, the code compares the **last two** iterations’ **`actual_cardinality`** values. If the absolute or relative delta exceeds **`STABLE_PLAN_ABS_DRIFT_TOLERANCE`** / **`STABLE_PLAN_REL_DRIFT_TOLERANCE`**, the expression is quarantined with **`[ALARM-CONTEXT-COLLISION] same key changed cardinality across iterations`** (```1434:1458:feedback_benchmark.py```). This does **not** require `plan_stable`; a changing plan can still trigger it if the same log key keeps matching with wildly different measured rows.
+
+**Exception for Corrected Guesses:** If the previous match was **not** injected (i.e., it was matched against a default vanilla estimate) but the current match **is** injected, the drift is safely ignored. This teaches the script to forgive massive cardinality shifts when it is simply correcting an initial, random mapping guess (e.g., from Iteration 1).
 
 **Concrete mini-scenario**
 
 
 | Stage              | Content                                                                                                                                                        |
 | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Iteration 3**    | Plan shape unchanged from iteration 2; match says expression `E` has actual **100_000** rows.                                                                  |
-| **Iteration 4**    | Same plan shape (`plan_stable=True`), but measured actual for `E` is **15_000_000**.                                                                           |
+| **Iteration 3**    | Match says expression `E` has actual **100_000** rows.                                                                                                        |
+| **Iteration 4**    | Same or different plan text; measured actual for `E` is **15_000_000**.                                                                                        |
 | **Thresholds**     | Default absolute **100** and relative **0.1%** — here both deltas blow past thresholds.                                                                        |
-| **Interpretation** | Something “stable” in structure is **not** stable in cardinality (stats bump, nondeterminism, wrong match identity). Safer to **quarantine** than poison JSON. |
+| **Interpretation** | The same JSON key is being tied to **inconsistent** measured cardinalities across runs (wrong identity, plan change, or nondeterminism). Safer to **quarantine** than poison JSON. |
 
 
-**Contrast with Flow H:** Flow G is **large** drift under stability; Flow H is **small** drift treated as noise.
+**Contrast with Flow H:** Flow G is **large** drift between consecutive history samples; Flow H is **small** drift on **JSON overwrite policy** when updating an existing key while `plan_stable` is true.
 
 ---
 
 ### Flow H — small drift ignored (JSON update policy)
 
-When `**update_actual_cardinality_json`** sees an existing key and the new actual differs only slightly **while** `plan_stable` is true, it may **keep the prior JSON value** and print `[INFO] Small stable-plan drift…` (implementation ~lines 1316–1338).
+When **`update_actual_cardinality_json`** sees an existing key (including legacy unnamespaced keys when the new write uses a namespaced key) and the new actual differs only slightly **while** `plan_stable` is not false, it may **keep the prior JSON value** and print `[INFO] Small stable-plan drift…` (```1042:1058:feedback_benchmark.py```). New keys are written under **`make_namespaced_expression_key(expression, plan_fingerprint)`** when `plan_fingerprint` is set; **`run_single_query`** currently passes **`plan_fingerprint=None`**, so the file uses **raw** `LOGICAL_JOIN` lines as keys unless you call the updater from custom code with a fingerprint.
 
 **Concrete mini-scenario**
 
@@ -391,39 +302,37 @@ This subsection orients reviewers who open the **engine** side before the Python
 
 ### What changed in `cardinality_estimator.cpp` (high level)
 
-The fork extends `**CardinalityEstimator::EstimateCardinalityWithSet`** so that:
+The fork extends **`CardinalityEstimator::EstimateCardinalityWithSet`** so that:
 
-1. **Loading feedback / oracle cardinalities** — At startup of estimation (or first use), the estimator reads `**actual_cardinality.json`**. The path defaults to a workspace constant but can be overridden with `**DUCKDB_ACTUAL_CARDINALITY_JSON**`. Keys are the **full string** of a `LOGICAL_JOIN` line (same format as in the log).
-2. **Writing the cardinality log** — Each multi-relation estimate appends to `**cardinality_log.txt`** (override: `**DUCKDB_CARDINALITY_LOG**`). Lines include `LOGICAL_JOIN: … Estimated Cardinality:` or `… using INJECTED Cardinality:` when a JSON key matched.
-3. **Plan fingerprint namespacing** — `**DUCKDB_FEEDBACK_PLAN_FINGERPRINT`** can scope injected keys when the Python benchmark namespaces JSON entries (`PLANFP:…::…`), so oscillating plans do not overwrite unrelated cardinalities.
-4. **Optional diagnostics** — Environment switches such as `**DUCKDB_DEBUG_CARD_ESTIMATE_NDJSON`** and `**DUCKDB_DUMP_INJECTION_STATS**` add NDJSON / stderr summaries for debugging injection counts (see comments near `DEBUG_CARD_ESTIMATE_*` and `DUMP_INJECTION_STATS` in the source).
+1. **Loading feedback / oracle cardinalities** — At startup of estimation (or first use), the estimator reads **`actual_cardinality.json`**. The path defaults to a workspace constant but can be overridden with **`DUCKDB_ACTUAL_CARDINALITY_JSON`**. Keys are the **full string** of a `LOGICAL_JOIN` line (same format as in the log).
+2. **Writing the cardinality log** — Each multi-relation estimate appends to **`cardinality_log.txt`** (override: **`DUCKDB_CARDINALITY_LOG`**). Lines include `LOGICAL_JOIN: … Estimated Cardinality:` or `… using INJECTED Cardinality:` when a JSON key matched.
+3. **Plan fingerprint namespacing** — **`DUCKDB_FEEDBACK_PLAN_FINGERPRINT`** can be set by **`run_query_with_json_profile`** (when `plan_fingerprint_hint` is non-`None`) so the estimator aligns with a fingerprinted JSON namespace. **`make_namespaced_expression_key`** / **`project_json_for_fingerprint`** in Python mirror that layout for verification and for JSON writes when `plan_fingerprint` is passed into **`update_actual_cardinality_json`**.
+4. **Optional diagnostics** — Environment switches such as **`DUCKDB_DEBUG_CARD_ESTIMATE_NDJSON`** and **`DUCKDB_DUMP_INJECTION_STATS`** add NDJSON / stderr summaries for debugging injection counts (see comments near `DEBUG_CARD_ESTIMATE_*` and `DUMP_INJECTION_STATS` in the source).
 
-The Python benchmark never parses planner internals directly for injection—it relies on these **textual keys** staying aligned with `**match_joins`**.
+The Python benchmark never parses planner internals directly for injection—it relies on these **textual keys** staying aligned with **`match_joins`**.
 
 ### `legacy_feedback/` directory
 
-`src/optimizer/join_order/legacy_feedback/` is a **frozen snapshot** of join-order sources from an earlier git revision (**“expt 1”**), **not** the code path used by the normal `duckdb` binary. Per `**legacy_feedback/README`**:
+`src/optimizer/join_order/legacy_feedback/` holds **copies** of selected join-order C++ sources (`cardinality_estimator.cpp`, `plan_enumerator.cpp`, etc.) from an **older** revision—useful for **diffing** or for **alternate build targets** that compile this snapshot instead of the main-tree join order. The default **`build/release/duckdb`** path used by **`feedback_benchmark.py`** is the **main** optimizer tree, not this folder.
 
-- It exists so you can build `**duckdb_feedback**` / `**duckdb_optimizer_join_order_feedback**` and compare behavior against the fork without losing the historical baseline.
-- Regenerate with `**scripts/refresh_legacy_feedback_sources.sh**` if you intentionally refresh that snapshot.
-
-Day-to-day feedback experiments should focus on `**cardinality_estimator.cpp**` (main tree) plus `**feedback_benchmark.py**`; use `**legacy_feedback**` only when you need an apples-to-apples comparison against that archived optimizer variant.
+Day-to-day feedback experiments should focus on **`cardinality_estimator.cpp`** under `src/optimizer/join_order/` plus **`feedback_benchmark.py`**; open **`legacy_feedback/`** when you need a frozen reference of how those files looked in the archived experiment.
 
 ---
 
 ## 6. Summary table (feedback-specific)
 
 
-| Mechanism                                     | Where                                | Effect                                 |
-| --------------------------------------------- | ------------------------------------ | -------------------------------------- |
-| No comparable conditions                      | `match_joins` 937–938                | Physical join skipped in matching loop |
-| No winning log line                           | end of `match_joins`                 | `unresolved`                           |
-| Multiple log candidates                       | `match_joins` + quarantine 2173–2178 | Ambiguous → unsafe                     |
-| Same `expression`, different actuals in batch | 2179–2190                            | Collision → unsafe                     |
-| Dynamic filter guard                          | 2206–2224                            | Unsafe                                 |
-| CTE duplicate detection                       | 1192–1201 + update 1285–1287         | Skip write                             |
-| Historical drift                              | 2246+                                | Unsafe                                 |
-| Small stable drift                            | 1316–1338                            | Keep existing JSON value               |
+| Mechanism                                     | Where                                      | Effect                                 |
+| --------------------------------------------- | ------------------------------------------ | -------------------------------------- |
+| No comparable conditions                      | `match_single_profile_join` 835–836        | Silent skip (not in `unresolved`)      |
+| No winning log line                           | `match_single_profile_join` 906–917        | `unresolved`                           |
+| Multiple log candidates                       | `_quarantine_ambiguous_matches` 1379–1388  | Ambiguous → unsafe                     |
+| Same `expression`, different actuals in batch | `_quarantine_same_key_actual_collisions` 1391–1407 | Collision → unsafe             |
+| Dynamic filter guard                          | `_quarantine_dynamic_filter_context` 1410–1431 | Unsafe                           |
+| CTE duplicate detection                       | `detect_cte_duplicates` 968–977; skip in `update_actual_cardinality_json` 1024–1026 | Skip write |
+| Cross-iteration drift                           | `_quarantine_cross_iteration_cardinality_drift` | Unsafe (unless correcting vanilla guess)    |
+| Small stable drift                            | `update_actual_cardinality_json` | Keep existing JSON value               |
+| Plan oscillation (same structure revisited)   | `run_single_query`               | Stops with `oscillation` in result dict (if plan changed, or no JSON updates pending) |
 
 
 ---
@@ -472,14 +381,18 @@ These are **mostly** incremental improvements **without** redesigning DuckDB’s
 
 | Topic                       | File                                                     | Approx. lines                |
 | --------------------------- | -------------------------------------------------------- | ---------------------------- |
-| Match profile ↔ log         | `feedback_benchmark.py` `match_joins`                    | 897–1185                     |
-| Parse log                   | `feedback_benchmark.py` `parse_cardinality_log`          | 570+                         |
-| CTE duplicate detection     | `feedback_benchmark.py` `detect_cte_duplicates`          | 1192–1201                    |
-| JSON update / skip CTE      | `feedback_benchmark.py` `update_actual_cardinality_json` | 1208–1400+                   |
-| Verify duplicate expr OK    | `feedback_benchmark.py` (Check 5)                        | 1713–1729                    |
-| Unsafe quarantine           | `feedback_benchmark.py` `run_single_query`               | 2171–2316                    |
+| Subprocess + env            | `feedback_benchmark.py` `child_duckdb_env`, `run_query_with_json_profile` | 259–316          |
+| Profile join extraction     | `feedback_benchmark.py` `extract_join_nodes`             | 375–438                      |
+| Match caches + single join  | `feedback_benchmark.py` `precompute_join_match_caches`, `match_single_profile_join`, `match_joins` | 719–961 |
+| Parse log                   | `feedback_benchmark.py` `parse_cardinality_log`          | 473+                         |
+| CTE duplicate detection     | `feedback_benchmark.py` `detect_cte_duplicates`          | 968–977                      |
+| JSON update / skip CTE      | `feedback_benchmark.py` `update_actual_cardinality_json` | 989–1082                     |
+| Purge quarantined keys      | `feedback_benchmark.py` `purge_unsafe_expressions_from_json` | 221+                     |
+| Verification checks 1–7     | `feedback_benchmark.py` `verify_check_*`, `verify_injection` | 1090–1316                |
+| Quarantine union            | `feedback_benchmark.py` `collect_quarantine_unsafe_expressions` | 1462–1469              |
+| Per-query feedback loop     | `feedback_benchmark.py` `run_single_query`               | 1500–1692                    |
 | Join cardinality invocation | `cost_model.cpp`, `plan_enumerator.cpp`                  | §1                           |
-| Estimator / log emission    | `cardinality_estimator.cpp`                              | `EstimateCardinalityWithSet` |
+| Estimator / log emission    | `cardinality_estimator.cpp` (main tree)                  | `EstimateCardinalityWithSet` |
 
 
 ---

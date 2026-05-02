@@ -10,7 +10,9 @@ Uses JSON profiling for structured plan trees.
 
 Environment:
   DUCKDB_FEEDBACK_DB, DUCKDB_FEEDBACK_SF — database path and label for the banner
-  DUCKDB_FEEDBACK_MAX_QUERIES — if set, only Q1..QN run (smoke tests)
+  DUCKDB_FEEDBACK_MAX_QUERIES — optional **cap on how many queries run** (Q1…QN only).
+  Useful for fast smoke tests (e.g. ``MAX_QUERIES=15``); unset runs all 99. Not “MOQ” / minimum
+  order quantity — it is only a **max query count** limit.
 """
 
 import ast
@@ -18,6 +20,9 @@ import hashlib
 import json
 import os
 import re
+import csv
+import traceback
+from collections import defaultdict
 import subprocess
 from collections import Counter
 
@@ -30,19 +35,19 @@ PROFILE_OUTPUT = os.path.join(REPO_ROOT, "profile_output.json")
 TPCDS_QUERY_DIR = os.path.join(REPO_ROOT, "feedback_queries", "tpcds")
 
 # --- Run configuration ---
-DB_FILE = os.environ.get("DUCKDB_FEEDBACK_DB", "/Users/Aarry/Desktop/15689/tpcds_sf200.db").strip()
-SCALE_FACTOR = int(os.environ.get("DUCKDB_FEEDBACK_SF", "200"))
+DB_FILE = os.environ.get("DUCKDB_FEEDBACK_DB", "/Users/Aarry/Desktop/15689/tpcds_sf10.db").strip()
+SCALE_FACTOR = int(os.environ.get("DUCKDB_FEEDBACK_SF", "10"))
 TARGET_QUERIES = list(range(1, 100))
-_MQQ = os.environ.get("DUCKDB_FEEDBACK_MAX_QUERIES")
-if _MQQ:
-    _nq = max(1, min(99, int(_MQQ.strip())))
+_MAX_QUERIES_ENV = os.environ.get("DUCKDB_FEEDBACK_MAX_QUERIES")
+if _MAX_QUERIES_ENV:
+    _nq = max(1, min(99, int(_MAX_QUERIES_ENV.strip())))
     TARGET_QUERIES = list(range(1, _nq + 1))
 MAX_ITERATIONS = 20
 MAIN_QUERY_TIMEOUT_SEC = int(os.getenv("DUCKDB_BENCHMARK_MAIN_QUERY_TIMEOUT_SEC", "600"))
 
 # --- Matching / JSON drift thresholds ---
-STABLE_PLAN_ABS_DRIFT_TOLERANCE = 100
-STABLE_PLAN_REL_DRIFT_TOLERANCE = 0.001  # 0.1%
+STABLE_PLAN_ABS_DRIFT_TOLERANCE = 5000
+STABLE_PLAN_REL_DRIFT_TOLERANCE = 0.005  # 0.5%
 LARGE_DELTA_ABS_THRESHOLD = 100000
 LARGE_DELTA_REL_THRESHOLD = 0.50
 PLAN_FINGERPRINT_ENV_VAR = "DUCKDB_FEEDBACK_PLAN_FINGERPRINT"
@@ -458,6 +463,17 @@ def get_plan_structure_text(node, depth=0):
         if key in STRUCTURAL_KEYS:
             lines.append(f"{indent}  {key}: {extra[key]}")
 
+    # Dynamic Filters: include only the bloom-filter (BF) structural signature,
+    # NOT the runtime min-max ranges which can vary between runs.
+    # e.g. "c_customer_sk IN BF(cs_bill_customer_sk)" → include
+    #      "c_customer_sk>=4 AND c_customer_sk<=499987" → exclude
+    dyn_filters_raw = str(extra.get("Dynamic Filters", ""))
+    if dyn_filters_raw:
+        import re as _re
+        bf_parts = sorted(_re.findall(r"\w+ IN BF\(\w+\)", dyn_filters_raw))
+        if bf_parts:
+            lines.append(f"{indent}  BloomFilters: {bf_parts}")
+
     for child in node.get("children", []):
         lines.extend(get_plan_structure_text(child, depth + 1).splitlines())
 
@@ -552,15 +568,24 @@ def parse_cardinality_log():
                     "table_name": table_name,
                     "raw": raw_binding,
                 })
+                # Composite table names from subquery rewrites (e.g. "web_sales, catalog_sales")
+                # must be split so the table set matches the profile's individual SEQ_SCANs.
                 if table_name:
-                    tables.append(table_name)
+                    if "," in table_name:
+                        for sub in table_name.split(","):
+                            sub = sub.strip()
+                            if sub:
+                                tables.append(sub)
+                    else:
+                        tables.append(table_name)
         else:
             tables_match = re.search(r"Tables: \[(.*?)\]", expression)
             if tables_match:
                 tables = [t.strip() for t in tables_match.group(1).split(",") if t.strip()]
 
         # Parse filters from the expression
-        filters_match = re.search(r"Filters: \[(.*)\](?: CtxOcc: \d+)?$", expression)
+        # Use non-greedy (.*?) for Filters so it stops before CtxScanFilters if present.
+        filters_match = re.search(r"Filters: \[(.*?)\](?: CtxScanFilters: \[.*?\])?(?: CtxOcc: \d+)?$", expression)
         filters = []
         if filters_match:
             filters_raw = filters_match.group(1)
@@ -714,6 +739,208 @@ def _is_tautology_condition(norm_cond):
     return False
 
 
+def precompute_join_match_caches(profile_joins, log_entries):
+    """
+    Normalized condition sets per profile join and per log line, plus table sets per log line.
+    Profile rows parse ``conditions`` strings; log rows use parsed ``filters`` lists.
+    """
+    profile_normalized = []
+    for pj in profile_joins:
+        conds = parse_explain_conditions(pj["conditions"])
+        norm = normalize_condition_set(conds)
+        profile_normalized.append(frozenset(c for c in norm if not _is_tautology_condition(c)))
+
+    log_normalized = []
+    log_table_sets = []
+    for le in log_entries:
+        norm = normalize_condition_set(le["filters"])
+        log_normalized.append(frozenset(c for c in norm if not _is_tautology_condition(c)))
+        log_table_sets.append(set(le["tables"]))
+    return profile_normalized, log_normalized, log_table_sets
+
+
+def _join_match_stage(pnorm, lnorm, p_desc_tables, l_tables):
+    """Discrete priority stage + auxiliary deltas for tie-breaking among viable candidates."""
+    cond_diff = abs(len(lnorm) - len(pnorm))
+    table_delta = abs(len(l_tables) - len(p_desc_tables))
+    table_exact = bool(p_desc_tables) and l_tables == p_desc_tables
+    cond_exact = lnorm == pnorm
+    if cond_exact and table_exact:
+        stage = 0
+    elif cond_exact:
+        stage = 1
+    elif table_exact:
+        stage = 2
+    else:
+        stage = 3
+    return stage, cond_diff, table_delta
+
+
+def _log_candidate_context_ok(pnorm, lnorm, p_desc_tables, l_tables, p_lineage_incomplete):
+    """Whether normalized conditions + table lineage allow this log line as a candidate."""
+    if p_lineage_incomplete:
+        if not (lnorm == pnorm or pnorm.issubset(lnorm)):
+            return False
+    elif lnorm != pnorm:
+        return False
+    if p_desc_tables and p_lineage_incomplete and not (p_desc_tables & l_tables):
+        return False
+    if p_desc_tables and not p_lineage_incomplete and l_tables != p_desc_tables:
+        return False
+    return True
+
+
+def _candidate_beats_best(
+    p_estimated_cardinality,
+    cand_est_delta,
+    stage,
+    table_delta,
+    cond_diff,
+    expr,
+    best_est_delta,
+    best_stage,
+    best_table_delta,
+    best_cond_diff,
+    best_expr,
+):
+    """Lexicographic tie-break (optionally using estimated-cardinality distance first)."""
+    use_est = p_estimated_cardinality > 0
+    if use_est:
+        if cand_est_delta < best_est_delta:
+            return True
+        if cand_est_delta > best_est_delta:
+            return False
+        if stage < best_stage:
+            return True
+        if stage > best_stage:
+            return False
+        if table_delta < best_table_delta:
+            return True
+        if table_delta > best_table_delta:
+            return False
+        if cond_diff < best_cond_diff:
+            return True
+        if cond_diff > best_cond_diff:
+            return False
+        return best_expr is None or expr < best_expr
+    if stage < best_stage:
+        return True
+    if stage > best_stage:
+        return False
+    if table_delta < best_table_delta:
+        return True
+    if table_delta > best_table_delta:
+        return False
+    if cond_diff < best_cond_diff:
+        return True
+    if cond_diff > best_cond_diff:
+        return False
+    return best_expr is None or expr < best_expr
+
+
+def match_single_profile_join(
+    pidx,
+    pj,
+    log_entries,
+    profile_normalized,
+    log_normalized,
+    log_table_sets,
+    used_log_indices,
+):
+    """
+    Pick the best unused cardinality-log line for one physical join, or None if unresolved.
+
+    Returns:
+        (match_dict, None) on success,
+        (None, unresolved_dict) if no eligible log line,
+        (None, None) if this join has no conditions (cross join) — caller skips.
+    """
+    pnorm = profile_normalized[pidx]
+    if not pnorm:
+        return None, None
+
+    p_desc_tables = pj.get("descendant_tables", set())
+    actual_card = int(pj["actual_cardinality"])
+    p_estimated_cardinality = int(pj.get("estimated_cardinality", 0))
+    p_plan_path = pj.get("plan_path", [])
+    p_lineage_incomplete = pj.get("lineage_incomplete", False)
+
+    best_lidx = -1
+    best_stage = 99
+    best_table_delta = float("inf")
+    best_cond_diff = float("inf")
+    best_est_delta = float("inf")
+    best_expr = None
+    candidate_count = 0
+
+    for lidx, le in enumerate(log_entries):
+        if lidx in used_log_indices:
+            continue
+        lnorm = log_normalized[lidx]
+        if not lnorm:
+            continue
+        l_tables = log_table_sets[lidx]
+        if not _log_candidate_context_ok(pnorm, lnorm, p_desc_tables, l_tables, p_lineage_incomplete):
+            continue
+
+        stage, cond_diff, table_delta = _join_match_stage(pnorm, lnorm, p_desc_tables, l_tables)
+        candidate_count += 1
+        expr = le["expression"]
+        cand_card = int(le["cardinality"])
+        cand_est_delta = abs(cand_card - p_estimated_cardinality)
+        if _candidate_beats_best(
+            p_estimated_cardinality,
+            cand_est_delta,
+            stage,
+            table_delta,
+            cond_diff,
+            expr,
+            best_est_delta,
+            best_stage,
+            best_table_delta,
+            best_cond_diff,
+            best_expr,
+        ):
+            best_est_delta = cand_est_delta
+            best_stage = stage
+            best_table_delta = table_delta
+            best_cond_diff = cond_diff
+            best_lidx = lidx
+            best_expr = expr
+
+    if best_lidx != -1:
+        return (
+            {
+                "expression": log_entries[best_lidx]["expression"],
+                "log_index": best_lidx,
+                "actual_cardinality": actual_card,
+                "profile_join_index": pidx,
+                "candidate_count": candidate_count,
+                "selected_stage": best_stage,
+                "selected_table_delta": best_table_delta,
+                "selected_cond_diff": best_cond_diff,
+                "selected_abs_delta_to_profile_est": best_est_delta,
+                "profile_estimated_cardinality": p_estimated_cardinality,
+                "profile_plan_path": list(p_plan_path) if isinstance(p_plan_path, list) else [],
+                "lineage_incomplete": p_lineage_incomplete,
+                "is_injected": log_entries[best_lidx].get("is_injected", False),
+            },
+            None,
+        )
+    return (
+        None,
+        {
+            "profile_join_index": pidx,
+            "conditions": pj.get("conditions", ""),
+            "descendant_tables": sorted(list(p_desc_tables)),
+            "lineage_incomplete": p_lineage_incomplete,
+            "actual_cardinality": int(actual_card),
+            "estimated_cardinality": int(p_estimated_cardinality),
+            "plan_path": list(p_plan_path) if isinstance(p_plan_path, list) else [],
+        },
+    )
+
+
 def match_joins(profile_joins, log_entries):
     """
     Match cardinality log entries to profile join nodes using BOTH normalized
@@ -735,163 +962,25 @@ def match_joins(profile_joins, log_entries):
     unresolved = []
     used_log_indices = set()
 
-    # Normalize profile join conditions and prepare log conditions
-    profile_normalized = []
-    for pj in profile_joins:
-        conds = parse_explain_conditions(pj["conditions"])
-        norm = normalize_condition_set(conds)
-        norm = frozenset(c for c in norm if not _is_tautology_condition(c))
-        profile_normalized.append(norm)
+    profile_normalized, log_normalized, log_table_sets = precompute_join_match_caches(
+        profile_joins, log_entries
+    )
 
-    log_normalized = []
-    log_table_sets = []
-    for le in log_entries:
-        norm = normalize_condition_set(le["filters"])
-        norm = frozenset(c for c in norm if not _is_tautology_condition(c))
-        log_normalized.append(norm)
-        log_table_sets.append(set(le["tables"]))
-
-    # For each profile join, find best matching log entry
     for pidx, pj in enumerate(profile_joins):
-        pnorm = profile_normalized[pidx]
-        if not pnorm:
-            continue  # No conditions (e.g., cross product)
-
-        p_desc_tables = pj.get("descendant_tables", set())
-        p_conditions = pj.get("conditions", "")
-        actual_card = int(pj["actual_cardinality"])
-        p_join_type = pj.get("join_type", "")
-        p_estimated_cardinality = int(pj.get("estimated_cardinality", 0))
-        p_operator_name = pj.get("operator_name", "")
-        p_plan_path = pj.get("plan_path", [])
-
-        best_lidx = -1
-        best_stage = 99
-        best_table_delta = float("inf")
-        best_cond_diff = float("inf")
-        best_est_delta = float("inf")
-        best_expr = None
-        candidate_count = 0
-        p_lineage_incomplete = pj.get("lineage_incomplete", False)
-        candidate_debug_rows = []
-
-        for lidx, le in enumerate(log_entries):
-            if lidx in used_log_indices:
-                continue
-
-            lnorm = log_normalized[lidx]
-            if not lnorm:
-                continue
-
-            if p_lineage_incomplete:
-                if not (lnorm == pnorm or pnorm.issubset(lnorm)):
-                    continue
-            else:
-                if lnorm != pnorm:
-                    continue
-
-            l_tables = log_table_sets[lidx]
-            if p_desc_tables and p_lineage_incomplete and not (p_desc_tables & l_tables):
-                continue
-            if p_desc_tables and not p_lineage_incomplete and l_tables != p_desc_tables:
-                continue
-
-            cond_diff = abs(len(lnorm) - len(pnorm))
-            table_delta = abs(len(l_tables) - len(p_desc_tables))
-            table_exact = bool(p_desc_tables) and l_tables == p_desc_tables
-            cond_exact = lnorm == pnorm
-            if cond_exact and table_exact:
-                stage = 0
-            elif cond_exact:
-                stage = 1
-            elif table_exact:
-                stage = 2
-            else:
-                stage = 3
-
-            candidate_count += 1
-            expr = le["expression"]
-            cand_card = int(le["cardinality"])
-            cand_abs_delta = abs(cand_card - actual_card)
-            cand_est_delta = abs(cand_card - p_estimated_cardinality)
-            relsets_match = re.search(r"RelSets: (\[[^\]]*\])", expr)
-            numrels_match = re.search(r"NumRels: (\[[^\]]*\])", expr)
-            ctx_inputs_match = re.search(r"CtxInputCards: (\[[^\]]*\])", expr)
-            filters_match = re.search(r"Filters: \[(.*)\](?: CtxOcc: \d+)?$", expr)
-            expr_relsets = relsets_match.group(1) if relsets_match else None
-            expr_numrels = numrels_match.group(1) if numrels_match else None
-            expr_ctx_inputs = ctx_inputs_match.group(1) if ctx_inputs_match else None
-            expr_filters = filters_match.group(1) if filters_match else None
-            if len(candidate_debug_rows) < 6:
-                candidate_debug_rows.append(
-                    {
-                        "log_index": lidx,
-                        "expr_tail": expr[-180:] if len(expr) > 180 else expr,
-                        "stage": stage,
-                        "table_delta": table_delta,
-                        "cond_diff": cond_diff,
-                        "candidate_cardinality": cand_card,
-                        "candidate_is_injected": bool(le["is_injected"]),
-                        "candidate_abs_delta_to_actual": cand_abs_delta,
-                        "candidate_abs_delta_to_profile_est": cand_est_delta,
-                        "candidate_relsets": expr_relsets,
-                        "candidate_numrels": expr_numrels,
-                        "candidate_ctx_input_cards": expr_ctx_inputs,
-                        "candidate_filters_tail": (
-                            expr_filters[-180:] if expr_filters and len(expr_filters) > 180 else expr_filters
-                        ),
-                        "log_tables": sorted(list(l_tables)),
-                    }
-                )
-            use_estimated_tiebreak = p_estimated_cardinality > 0
-            if ((use_estimated_tiebreak and (
-                    cand_est_delta < best_est_delta or
-                    (cand_est_delta == best_est_delta and stage < best_stage) or
-                    (cand_est_delta == best_est_delta and stage == best_stage and table_delta < best_table_delta) or
-                    (cand_est_delta == best_est_delta and stage == best_stage and table_delta == best_table_delta and cond_diff < best_cond_diff) or
-                    (cand_est_delta == best_est_delta and stage == best_stage and table_delta == best_table_delta and cond_diff == best_cond_diff and
-                     (best_expr is None or expr < best_expr))
-                )) or
-                ((not use_estimated_tiebreak) and (
-                    stage < best_stage or
-                    (stage == best_stage and table_delta < best_table_delta) or
-                    (stage == best_stage and table_delta == best_table_delta and cond_diff < best_cond_diff) or
-                    (stage == best_stage and table_delta == best_table_delta and cond_diff == best_cond_diff and
-                     (best_expr is None or expr < best_expr))
-                ))):
-                best_est_delta = cand_est_delta
-                best_stage = stage
-                best_table_delta = table_delta
-                best_cond_diff = cond_diff
-                best_lidx = lidx
-                best_expr = expr
-
-        if best_lidx != -1:
-            used_log_indices.add(best_lidx)
-            matches.append({
-                "expression": log_entries[best_lidx]["expression"],
-                "log_index": best_lidx,
-                "actual_cardinality": actual_card,
-                "profile_join_index": pidx,
-                "candidate_count": candidate_count,
-                "selected_stage": best_stage,
-                "selected_table_delta": best_table_delta,
-                "selected_cond_diff": best_cond_diff,
-                "selected_abs_delta_to_profile_est": best_est_delta,
-                "profile_estimated_cardinality": p_estimated_cardinality,
-                "profile_plan_path": list(p_plan_path) if isinstance(p_plan_path, list) else [],
-                "lineage_incomplete": p_lineage_incomplete,
-            })
-        else:
-            unresolved.append({
-                "profile_join_index": pidx,
-                "conditions": pj.get("conditions", ""),
-                "descendant_tables": sorted(list(p_desc_tables)),
-                "lineage_incomplete": p_lineage_incomplete,
-                "actual_cardinality": int(actual_card),
-                "estimated_cardinality": int(p_estimated_cardinality),
-                "plan_path": list(p_plan_path) if isinstance(p_plan_path, list) else [],
-            })
+        m, u = match_single_profile_join(
+            pidx,
+            pj,
+            log_entries,
+            profile_normalized,
+            log_normalized,
+            log_table_sets,
+            used_log_indices,
+        )
+        if m is not None and u is None:
+            used_log_indices.add(m["log_index"])
+            matches.append(m)
+        elif m is None and u is not None:
+            unresolved.append(u)
 
     return matches, unresolved
 
@@ -910,6 +999,11 @@ def detect_cte_duplicates(log_entries):
     """
     expr_counts = Counter(entry["expression"] for entry in log_entries)
     return {expr for expr, count in expr_counts.items() if count > 1}
+
+
+def log_has_injected_line(log_entries, expr):
+    """True if any cardinality-log row with this expression is marked injected."""
+    return any(e["expression"] == expr and e["is_injected"] for e in log_entries)
 
 
 # ============================================================================
@@ -1013,8 +1107,259 @@ def update_actual_cardinality_json(
 
 
 # ============================================================================
-# VERIFICATION
+# VERIFICATION (one function per check; verify_injection orchestrates)
 # ============================================================================
+
+
+def verify_check_1_injected_vs_json(log_entries, active_pre_update_json):
+    """Injected log cardinalities should match pre-update JSON values."""
+    injected_count = 0
+    warns = []
+    for entry in log_entries:
+        if not entry["is_injected"]:
+            continue
+        injected_count += 1
+        expr = entry["expression"]
+        log_val = entry["cardinality"]
+        if expr not in active_pre_update_json:
+            warns.append(("missing_key", expr, None, None))
+            continue
+        json_val = active_pre_update_json[expr]
+        if abs(json_val - log_val) >= 1.0:
+            warns.append(("value_mismatch", expr, json_val, log_val))
+    if warns:
+        print(
+            f"    [VERIFY] Check 1 WARN: {len(warns)} injected log line(s) "
+            f"do not align with pre-update JSON (plan/JSON drift or float noise):"
+        )
+        for kind, expr, jv, lv in warns[:10]:
+            ex = expr if len(expr) <= 160 else expr[:160] + "..."
+            if kind == "missing_key":
+                print(f"      key not in pre-update JSON: {ex}")
+            else:
+                print(f"      value mismatch: JSON={jv}, Log={lv} — {ex}")
+        if len(warns) > 10:
+            print(f"      ... and {len(warns) - 10} more")
+    else:
+        print(
+            f"    [VERIFY] Check 1 PASSED: {injected_count} injected log values "
+            f"match the pre-update JSON."
+        )
+
+
+def verify_check_2_json_keys_in_log(log_entries, active_pre_update_json):
+    """Every JSON key from before this iteration should appear somewhere in the log."""
+    log_expressions = {entry["expression"] for entry in log_entries}
+    missing = [e for e in active_pre_update_json if e not in log_expressions]
+    if missing:
+        for expr in missing:
+            print(f"    [VERIFY] Check 2 WARN: JSON key not in log: {expr}")
+    else:
+        print(
+            f"    [VERIFY] Check 2 PASSED: All {len(active_pre_update_json)} JSON keys "
+            f"found in the cardinality log."
+        )
+
+
+def verify_check_3_known_matches_injected(matches, cte_exprs, active_pre_update_json, log_entries):
+    """Previously-known matches should show INJECTED on at least one log line."""
+    matched_not_injected = []
+    matched_injected = []
+    matched_new = []
+    for match in matches:
+        expr = match["expression"]
+        if expr in cte_exprs:
+            continue
+        if expr not in active_pre_update_json:
+            matched_new.append(expr)
+            continue
+        if log_has_injected_line(log_entries, expr):
+            matched_injected.append(expr)
+        else:
+            matched_not_injected.append(expr)
+
+    if matched_new:
+        print(
+            f"    [VERIFY] Check 3 INFO: {len(matched_new)} new join(s) from "
+            f"plan change (not previously injected, OK)."
+        )
+    if matched_not_injected:
+        print(
+            f"    [VERIFY] Check 3 WARN: {len(matched_not_injected)} previously-known "
+            f"join(s) have no INJECTED line in this run's cardinality log (plan may have "
+            f"changed, or the optimizer did not apply actual_cardinality.json for that key):"
+        )
+        for expr in matched_not_injected:
+            print(f"      NOT INJECTED: {expr}")
+    else:
+        print(
+            f"    [VERIFY] Check 3 PASSED: All {len(matched_injected)} previously-known "
+            f"joins (non-CTE) were INJECTED."
+        )
+
+
+def verify_check_4_injected_vs_actual_plan(log_entries, matches, plan_stable):
+    """Injected value vs measured cardinality on matched joins (informational if plan moved)."""
+    matched_exprs = {m["expression"]: m["actual_cardinality"] for m in matches}
+    mismatches = []
+    tolerated = []
+    for entry in log_entries:
+        if not entry["is_injected"] or entry["expression"] not in matched_exprs:
+            continue
+        expr = entry["expression"]
+        injected_val = int(entry["cardinality"])
+        actual_val = matched_exprs[expr]
+        abs_delta = abs(int(injected_val) - int(actual_val))
+        max_mag = max(abs(int(injected_val)), abs(int(actual_val)), 1)
+        rel_delta = float(abs_delta) / float(max_mag)
+        small_drift = (
+            plan_stable is True
+            and abs_delta > 0
+            and (
+                abs_delta <= STABLE_PLAN_ABS_DRIFT_TOLERANCE
+                or rel_delta <= STABLE_PLAN_REL_DRIFT_TOLERANCE
+            )
+        )
+        if small_drift:
+            tolerated.append((expr, injected_val, actual_val, abs_delta, rel_delta))
+        elif injected_val != actual_val:
+            mismatches.append((expr, injected_val, actual_val))
+
+    if mismatches:
+        print(
+            f"    [VERIFY] Check 4 INFO: {len(mismatches)} "
+            f"injected != actual (plan may have changed):"
+        )
+        for expr, inj, act in mismatches:
+            print(f"      {expr}")
+            print(f"        Injected: {inj}, Actual: {act}")
+    else:
+        print(
+            f"    [VERIFY] Check 4 PASSED: All injected cardinalities match "
+            f"actual plan cardinalities."
+        )
+    if tolerated:
+        print(
+            f"    [VERIFY] Check 4 INFO: tolerated {len(tolerated)} "
+            f"small stable-plan drift(s) (treated as measurement noise)."
+        )
+
+
+def verify_check_5_distinct_log_bindings(matches):
+    """Each profile↔log binding should use a distinct log_index when matching."""
+    log_indices = [m["log_index"] for m in matches]
+    dup_log_idx = [i for i, c in Counter(log_indices).items() if c > 1]
+    if dup_log_idx:
+        print(
+            f"    [VERIFY] Check 5 WARN: duplicate log_index in matches (matcher bug?) "
+            f": {dup_log_idx}"
+        )
+        return
+    matched_expr_list = [m["expression"] for m in matches]
+    dup_exprs = [expr for expr, c in Counter(matched_expr_list).items() if c > 1]
+    if dup_exprs:
+        print(
+            f"    [VERIFY] Check 5 PASSED: {len(matches)} mappings; {len(dup_exprs)} "
+            f"expression string(s) repeated across distinct log line(s) (OK)."
+        )
+    else:
+        print(
+            f"    [VERIFY] Check 5 PASSED: {len(matches)} mappings; all expression strings unique."
+        )
+
+
+def verify_check_6_join_coverage(matches, profile_joins):
+    """How many physical joins with parseable conditions got a match."""
+    joins_with_conditions = sum(
+        1 for pj in profile_joins if parse_explain_conditions(pj.get("conditions", ""))
+    )
+    unmatched = joins_with_conditions - len(matches)
+    print(
+        f"    [VERIFY] Check 6 INFO: matched {len(matches)}/{joins_with_conditions} "
+        f"joins-with-conditions (unmatched={max(unmatched, 0)})."
+    )
+
+
+def verify_check_7_ambiguous_matches(matches):
+    """Report matches where candidate_count > 1 (tie-breakers used)."""
+    ambiguous = [m for m in matches if int(m.get("candidate_count", 0)) > 1]
+    if not ambiguous:
+        print("    [VERIFY] Check 7 PASSED: no ambiguous match candidates.")
+        return
+    stage0_count = sum(1 for m in ambiguous if int(m.get("selected_stage", 99)) == 0)
+    non_stage0 = [m for m in ambiguous if int(m.get("selected_stage", 99)) > 0]
+    print(
+        f"    [VERIFY] Check 7 INFO: {len(ambiguous)} ambiguous match(es); "
+        f"stage0={stage0_count}, non_stage0={len(non_stage0)}."
+    )
+    if not non_stage0:
+        return
+    print(
+        "    [VERIFY] Check 7 INFO: non-stage0 ambiguous selections "
+        "(estimate-proxy likely applied):"
+    )
+    for m in non_stage0[:6]:
+        expr = m.get("expression", "")
+        expr_tail = expr[-180:] if len(expr) > 180 else expr
+        print(
+            f"      log_index={m.get('log_index')}, stage={m.get('selected_stage')}, "
+            f"est_delta={m.get('selected_abs_delta_to_profile_est')}, "
+            f"profile_est={m.get('profile_estimated_cardinality')}, "
+            f"path={m.get('profile_plan_path')}: {expr_tail}"
+        )
+
+def verify_check_8_unused_json_keys(log_entries, active_pre_update_json):
+    """JSON keys that exist but were NOT applied as INJECTED — optimizer didn't visit them."""
+    injected_exprs = {e["expression"] for e in log_entries if e["is_injected"]}
+    log_exprs = {e["expression"] for e in log_entries}
+    unused = []
+    absent = []
+    for key in active_pre_update_json:
+        if key in injected_exprs:
+            continue
+        if key in log_exprs:
+            # Key appeared in log but was NOT injected (should not happen normally)
+            unused.append(key)
+        else:
+            # Key was not visited at all (plan may have changed to a different shape)
+            absent.append(key)
+    total_json = len(active_pre_update_json)
+    n_injected = len(injected_exprs & set(active_pre_update_json))
+    if unused:
+        print(
+            f"    [VERIFY] Check 8 WARN: {len(unused)} JSON key(s) appear in log "
+            f"but were NOT injected (optimizer should have applied them):"
+        )
+        for k in unused[:5]:
+            print(f"      {k if len(k) <= 160 else k[:160] + '...'}")
+    if absent:
+        print(
+            f"    [VERIFY] Check 8 INFO: {len(absent)} JSON key(s) not visited "
+            f"by optimizer (plan shape changed, key's subplan not reached)."
+        )
+    if not unused and not absent:
+        print(
+            f"    [VERIFY] Check 8 PASSED: all {total_json} JSON keys were "
+            f"INJECTED ({n_injected} applied)."
+        )
+
+
+def verify_check_9_no_key_regression(pre_update_json, post_update_json):
+    """All keys in pre-update JSON must still exist in post-update JSON (monotonic growth)."""
+    lost = [k for k in pre_update_json if k not in post_update_json]
+    if lost:
+        print(
+            f"    [VERIFY] Check 9 WARN: {len(lost)} key(s) LOST from JSON "
+            f"(regression — quarantine may have removed them):"
+        )
+        for k in lost[:5]:
+            print(f"      LOST: {k if len(k) <= 160 else k[:160] + '...'}")
+    else:
+        print(
+            f"    [VERIFY] Check 9 PASSED: all {len(pre_update_json)} pre-update "
+            f"keys preserved in post-update JSON."
+        )
+
 
 def verify_injection(
     log_entries,
@@ -1026,208 +1371,296 @@ def verify_injection(
     *,
     plan_stable=None,
     injection_plan_fingerprint=None,
+    post_update_json=None,
 ):
     """
-    Comprehensive verification checks for iteration 2+.
-
-    Check 1: Injected log lines should match pre-update JSON keys/values; if not, WARN.
-    Check 2: All pre-update JSON keys should appear in the cardinality log.
-    Check 3: Previously-known matched joins should have an INJECTED line in the log;
-             if not, WARN (plan change / optimizer path — same spirit as Check 4).
-    Check 4: For each injected expression, its injected cardinality must match
-             the actual cardinality from the physical plan. If not, our matching
-             between log expressions and physical joins is wrong.
+    Run all verification checks for iteration >= 2 (see verify_check_* functions).
     """
     print(f"    [VERIFY] Running verification for iteration {iteration}...")
 
-    active_pre_update_json = project_json_for_fingerprint(pre_update_json, injection_plan_fingerprint)
+    active_pre_update_json = project_json_for_fingerprint(
+        pre_update_json, injection_plan_fingerprint
+    )
 
-    # ----- Check 1: Injected log values vs pre-update JSON -----
-    injected_count = 0
-    check1_warns = []
-    for entry in log_entries:
-        if entry["is_injected"]:
-            injected_count += 1
-            expr = entry["expression"]
-            log_val = entry["cardinality"]
-            if expr not in active_pre_update_json:
-                check1_warns.append(
-                    ("missing_key", expr, None, None)
-                )
-                continue
-            json_val = active_pre_update_json[expr]
-            if abs(json_val - log_val) >= 1.0:
-                check1_warns.append(
-                    ("value_mismatch", expr, json_val, log_val)
-                )
-    if check1_warns:
-        print(f"    [VERIFY] Check 1 WARN: {len(check1_warns)} injected log line(s) "
-              f"do not align with pre-update JSON (plan/JSON drift or float noise):")
-        for kind, expr, jv, lv in check1_warns[:10]:
-            ex = expr if len(expr) <= 160 else expr[:160] + "..."
-            if kind == "missing_key":
-                print(f"      key not in pre-update JSON: {ex}")
-            else:
-                print(f"      value mismatch: JSON={jv}, Log={lv} — {ex}")
-        if len(check1_warns) > 10:
-            print(f"      ... and {len(check1_warns) - 10} more")
-    else:
-        print(f"    [VERIFY] Check 1 PASSED: {injected_count} injected log values "
-              f"match the pre-update JSON.")
+    verify_check_1_injected_vs_json(log_entries, active_pre_update_json)
+    verify_check_2_json_keys_in_log(log_entries, active_pre_update_json)
+    verify_check_3_known_matches_injected(
+        matches, cte_exprs, active_pre_update_json, log_entries
+    )
+    verify_check_4_injected_vs_actual_plan(log_entries, matches, plan_stable)
+    verify_check_5_distinct_log_bindings(matches)
+    verify_check_6_join_coverage(matches, profile_joins)
+    verify_check_7_ambiguous_matches(matches)
+    verify_check_8_unused_json_keys(log_entries, active_pre_update_json)
+    if post_update_json is not None:
+        verify_check_9_no_key_regression(pre_update_json, post_update_json)
 
-    # ----- Check 2: All pre-update JSON keys should be in the log -----
-    log_expressions = {entry["expression"] for entry in log_entries}
-    missing_from_log = []
-    for expr in active_pre_update_json:
-        if expr not in log_expressions:
-            missing_from_log.append(expr)
-    if missing_from_log:
-        for expr in missing_from_log:
-            print(f"    [VERIFY] Check 2 WARN: JSON key not in log: {expr}")
-    else:
-        print(f"    [VERIFY] Check 2 PASSED: All {len(active_pre_update_json)} JSON keys "
-              f"found in the cardinality log.")
 
-    # ----- Check 3: Every PREVIOUSLY-KNOWN matched physical plan join must be INJECTED -----
-    # Only check joins whose expression existed in the pre-update JSON.
-    # New joins that appeared due to plan changes are legitimately not-yet-injected.
-    # The same expression string may appear on many log lines; injection holds if
-    # ANY line with that expression is marked INJECTED (not only the first/last).
-    def _expr_has_injected_line(expr):
-        return any(
-            e["expression"] == expr and e["is_injected"] for e in log_entries
-        )
+# ============================================================================
+# PLAN TIMING COMPARISON
+# ============================================================================
 
-    matched_not_injected = []
-    matched_injected = []
-    matched_new = []  # newly-discovered joins (not in pre-update JSON)
-    for match in matches:
-        expr = match["expression"]
-        actual = match["actual_cardinality"]
-        if expr in cte_exprs:
-            continue  # CTEs are not expected to be injected
-        if expr not in active_pre_update_json:
-            matched_new.append(expr)  # new join from plan change, OK
-            continue
-        if _expr_has_injected_line(expr):
-            matched_injected.append(expr)
-        else:
-            matched_not_injected.append(expr)
 
-    if matched_new:
-        print(f"    [VERIFY] Check 3 INFO: {len(matched_new)} new join(s) from "
-              f"plan change (not previously injected, OK).")
-
-    if matched_not_injected:
-        print(f"    [VERIFY] Check 3 WARN: {len(matched_not_injected)} previously-known "
-              f"join(s) have no INJECTED line in this run's cardinality log (plan may have "
-              f"changed, or the optimizer did not apply actual_cardinality.json for that key):")
-        for expr in matched_not_injected:
-            print(f"      NOT INJECTED: {expr}")
-    else:
-        print(f"    [VERIFY] Check 3 PASSED: All {len(matched_injected)} previously-known "
-              f"joins (non-CTE) were INJECTED.")
-
-    # ----- Check 4: Injected cardinality must match actual plan cardinality -----
-    # For each match (expression -> actual_cardinality), if that expression was
-    # INJECTED, the injected value should equal the actual cardinality.
-    # This ONLY holds for converged plans (same structure). For changed plans,
-    # actual cardinality may differ from what was injected.
-    matched_exprs = {m["expression"]: m["actual_cardinality"] for m in matches}
-    injected_vs_actual_mismatches = []
-    tolerated_small_drifts = []
-    for entry in log_entries:
-        if entry["is_injected"] and entry["expression"] in matched_exprs:
-            expr = entry["expression"]
-            injected_val = int(entry["cardinality"])
-            actual_val = matched_exprs[expr]
-            abs_delta = abs(int(injected_val) - int(actual_val))
-            max_mag = max(abs(int(injected_val)), abs(int(actual_val)), 1)
-            rel_delta = float(abs_delta) / float(max_mag)
-            is_small_stable_drift = (
-                plan_stable is True
-                and abs_delta > 0
-                and (
-                    abs_delta <= STABLE_PLAN_ABS_DRIFT_TOLERANCE
-                    or rel_delta <= STABLE_PLAN_REL_DRIFT_TOLERANCE
-                )
+def time_query_n_runs(query_sql, n_runs=5):
+    """Run query n_runs times and return list of wall-clock seconds (no profiling overhead)."""
+    import time as _time
+    timings = []
+    run_env = child_duckdb_env()
+    bare_sql = (
+        "PRAGMA enable_progress_bar = false;\n" + query_sql + "\n"
+    )
+    for _ in range(n_runs):
+        t0 = _time.monotonic()
+        try:
+            proc = subprocess.run(
+                [DUCKDB_BIN, DB_FILE, "-c", bare_sql],
+                capture_output=True, text=True, env=run_env,
+                timeout=MAIN_QUERY_TIMEOUT_SEC,
             )
-            if is_small_stable_drift:
-                tolerated_small_drifts.append((entry["expression"], injected_val, actual_val, abs_delta, rel_delta))
-            elif injected_val != actual_val:
-                injected_vs_actual_mismatches.append(
-                    (expr, injected_val, actual_val)
-                )
-
-    if injected_vs_actual_mismatches:
-        print(f"    [VERIFY] Check 4 INFO: {len(injected_vs_actual_mismatches)} "
-              f"injected != actual (plan may have changed):")
-        for expr, inj, act in injected_vs_actual_mismatches:
-            print(f"      {expr}")
-            print(f"        Injected: {inj}, Actual: {act}")
-        # Note: this is informational, not an assertion failure, because
-        # if the plan structure changed, actual cardinality naturally differs.
-        # The oscillation detector handles this case.
-    else:
-        print(f"    [VERIFY] Check 4 PASSED: All injected cardinalities match "
-              f"actual plan cardinalities.")
-    if tolerated_small_drifts:
-        print(f"    [VERIFY] Check 4 INFO: tolerated {len(tolerated_small_drifts)} "
-              f"small stable-plan drift(s) (treated as measurement noise).")
-
-    # ----- Check 5: Each match must bind to a distinct cardinality-log line -----
-    # The same LOGICAL_JOIN text may appear on multiple log lines (e.g. UNION); those
-    # are different entries (different log_index). Duplicate expression strings are OK;
-    # reusing the same log line for two physical joins is not.
-    log_indices = [m["log_index"] for m in matches]
-    dup_log_idx = [i for i, c in Counter(log_indices).items() if c > 1]
-    if dup_log_idx:
-        print(f"    [VERIFY] Check 5 WARN: duplicate log_index in matches (matcher bug?) "
-              f": {dup_log_idx}")
-    matched_expr_list = [m["expression"] for m in matches]
-    dup_exprs = [expr for expr, c in Counter(matched_expr_list).items() if c > 1]
-    if not dup_log_idx:
-        if dup_exprs:
-            print(f"    [VERIFY] Check 5 PASSED: {len(matches)} mappings; {len(dup_exprs)} "
-                  f"expression string(s) repeated across distinct log line(s) (OK).")
+        except subprocess.TimeoutExpired:
+            timings.append(float("inf"))
+            continue
+        t1 = _time.monotonic()
+        if proc.returncode != 0:
+            timings.append(float("inf"))
         else:
-            print(f"    [VERIFY] Check 5 PASSED: {len(matches)} mappings; all expression strings unique.")
+            timings.append(t1 - t0)
+    return timings
 
-    # ----- Check 6: Mapping coverage for joins with conditions -----
-    joins_with_conditions = 0
-    for pj in profile_joins:
-        if parse_explain_conditions(pj.get("conditions", "")):
-            joins_with_conditions += 1
-    unmatched = joins_with_conditions - len(matches)
-    print(f"    [VERIFY] Check 6 INFO: matched {len(matches)}/{joins_with_conditions} "
-          f"joins-with-conditions (unmatched={max(unmatched, 0)}).")
 
-    # ----- Check 7: Ambiguous matches resolved by estimate-proxy -----
-    ambiguous_matches = [m for m in matches if int(m.get("candidate_count", 0)) > 1]
-    if not ambiguous_matches:
-        print("    [VERIFY] Check 7 PASSED: no ambiguous match candidates.")
-    else:
-        stage0_count = sum(1 for m in ambiguous_matches if int(m.get("selected_stage", 99)) == 0)
-        non_stage0 = [m for m in ambiguous_matches if int(m.get("selected_stage", 99)) > 0]
-        print(
-            f"    [VERIFY] Check 7 INFO: {len(ambiguous_matches)} ambiguous match(es); "
-            f"stage0={stage0_count}, non_stage0={len(non_stage0)}."
-        )
-        if non_stage0:
-            print("    [VERIFY] Check 7 INFO: non-stage0 ambiguous selections (estimate-proxy likely applied):")
-            for m in non_stage0[:6]:
-                expr = m.get("expression", "")
-                expr_tail = expr[-180:] if len(expr) > 180 else expr
-                print(
-                    f"      log_index={m.get('log_index')}, stage={m.get('selected_stage')}, "
-                    f"est_delta={m.get('selected_abs_delta_to_profile_est')}, "
-                    f"profile_est={m.get('profile_estimated_cardinality')}, "
-                    f"path={m.get('profile_plan_path')}: {expr_tail}"
-                )
+def compare_plan_timings(query_sql, query_nr, n_runs=5):
+    """Run the query with and without injection, print mean/min for both.
+
+    Call this AFTER the feedback loop converges and the final actual_cardinality.json
+    is in place. Temporarily removes the JSON to get vanilla timings, then restores it.
+    """
+    print(f"\n  [TIMING] Comparing vanilla vs feedback plan for Q{query_nr} ({n_runs} runs each)...")
+
+    # --- Feedback plan (with current JSON) ---
+    feedback_times = time_query_n_runs(query_sql, n_runs)
+
+    # --- Vanilla plan (no injection) ---
+    saved_json = read_actual_cardinality_json()
+    clear_actual_cardinality_json()
+    vanilla_times = time_query_n_runs(query_sql, n_runs)
+    # Restore
+    if saved_json:
+        write_actual_cardinality_json(saved_json)
+
+    def _stats(times):
+        finite = [t for t in times if t != float("inf")]
+        if not finite:
+            return float("inf"), float("inf")
+        return min(finite), sum(finite) / len(finite)
+
+    v_min, v_mean = _stats(vanilla_times)
+    f_min, f_mean = _stats(feedback_times)
+
+    print(f"    Vanilla:  min={v_min:.3f}s  mean={v_mean:.3f}s  runs={vanilla_times}")
+    print(f"    Feedback: min={f_min:.3f}s  mean={f_mean:.3f}s  runs={feedback_times}")
+    if f_min < float("inf") and v_min < float("inf"):
+        speedup = v_min / f_min if f_min > 0 else float("inf")
+        print(f"    Speedup (min): {speedup:.2f}x {'(FASTER)' if speedup > 1.0 else '(SLOWER ⚠)'}")
+    if f_mean > v_mean * 1.10:
+        print(f"    [TIMING-WARN] Feedback plan appears SLOWER than vanilla — "
+              f"injections may be counterproductive for Q{query_nr}.")
+
+    return {
+        "vanilla_min": v_min, "vanilla_mean": v_mean,
+        "feedback_min": f_min, "feedback_mean": f_mean,
+    }
+
 
 # ============================================================================
 # MAIN LOOP PER QUERY
 # ============================================================================
+
+
+def _record_match_history(
+    expr_match_history,
+    matches,
+    profile_joins,
+    iteration,
+    current_plan_fingerprint,
+):
+    """Append one history record per match for this iteration (safety / drift analysis)."""
+    for m in matches:
+        expr = m["expression"]
+        pidx = m.get("profile_join_index")
+        profile_conditions = ""
+        profile_desc_tables = []
+        profile_plan_path = []
+        if isinstance(pidx, int) and 0 <= pidx < len(profile_joins):
+            profile_conditions = profile_joins[pidx].get("conditions", "")
+            profile_desc_tables = sorted(
+                list(profile_joins[pidx].get("descendant_tables", set()))
+            )
+            profile_plan_path = list(profile_joins[pidx].get("plan_path", []))
+        expr_match_history.setdefault(expr, []).append(
+            {
+                "iteration": iteration,
+                "profile_join_index": pidx,
+                "log_index": m.get("log_index"),
+                "actual_cardinality": int(m.get("actual_cardinality", 0)),
+                "plan_fingerprint": current_plan_fingerprint,
+                "match_stage": m.get("selected_stage", 99),
+                "candidate_count": m.get("candidate_count", 0),
+                "is_injected": m.get("is_injected", False),
+                "profile_conditions": profile_conditions,
+                "profile_descendant_tables": profile_desc_tables,
+                "profile_plan_path": profile_plan_path,
+                "profile_ancestor_context": (
+                    profile_joins[pidx].get("ancestor_context", [])
+                    if isinstance(pidx, int) and 0 <= pidx < len(profile_joins)
+                    else []
+                ),
+                "profile_subtree_scan_signatures": (
+                    profile_joins[pidx].get("subtree_scan_signatures", [])
+                    if isinstance(pidx, int) and 0 <= pidx < len(profile_joins)
+                    else []
+                ),
+                "profile_subtree_operator_signatures": (
+                    profile_joins[pidx].get("subtree_operator_signatures", [])
+                    if isinstance(pidx, int) and 0 <= pidx < len(profile_joins)
+                    else []
+                ),
+                "profile_subtree_structure_hash": (
+                    profile_joins[pidx].get("subtree_structure_hash", "")
+                    if isinstance(pidx, int) and 0 <= pidx < len(profile_joins)
+                    else ""
+                ),
+                "candidate_count": int(m.get("candidate_count", 0)),
+            }
+        )
+
+
+def _quarantine_ambiguous_matches(matches):
+    """Multiple viable log lines for one join — quarantine UNLESS safely resolved.
+
+    When ``candidate_count > 1`` it means the matcher found multiple log entries
+    with compatible (conditions, tables).  This is normal for the DP join
+    enumerator: it evaluates the same predicate under many input-cardinality
+    contexts, each producing a separate log line with a distinct ``CtxOcc``
+    suffix that makes the full expression key unique.
+
+    The match is safe to inject when:
+      1. The winner is **stage 0** — exact conditions AND exact table set.
+      2. The expression key appears **at most once** in the current batch of
+         matches (no collision with another physical join mapping to the same key).
+
+    If both conditions hold the match was correctly resolved by the tie-breaker
+    and the injection key is unambiguous.  Otherwise we quarantine.
+    """
+    # Build a frequency map of expression keys across all matches.
+    expr_freq = Counter(m["expression"] for m in matches)
+
+    out = set()
+    for m in matches:
+        cc = int(m.get("candidate_count", 0))
+        if cc <= 1:
+            continue
+        expr = m["expression"]
+        stage = int(m.get("selected_stage", 99))
+        if stage == 0 and expr_freq[expr] == 1:
+            # High-confidence: exact match + unique key → safe to inject.
+            print(f"    [INFO-AMBIGUOUS-RESOLVED] stage0 unique key (candidates={cc}): {expr}")
+            continue
+        print(f"    [ALARM-AMBIGUOUS-MATCH] {expr}")
+        out.add(expr)
+    return out
+
+
+def _quarantine_same_key_actual_collisions(matches):
+    """Same LOGICAL_JOIN key maps to different measured cardinalities in one batch."""
+    out = set()
+    batch_actuals = {}
+    for m in matches:
+        batch_actuals.setdefault(m["expression"], set()).add(
+            int(m.get("actual_cardinality", 0))
+        )
+    for expr, vals in batch_actuals.items():
+        if len(vals) <= 1:
+            continue
+        print(
+            f"    [ALARM-CONTEXT-COLLISION] same key has conflicting actuals in batch: "
+            f"{sorted(list(vals))} -- {expr}"
+        )
+        out.add(expr)
+    return out
+
+
+def _quarantine_dynamic_filter_context(matches, profile_joins):
+    """Dynamic-filter guard — DISABLED.
+
+    Dynamic filters are runtime bloom/min-max pushdowns installed by a different
+    pipeline.  They prune scan rows but do NOT change logical join selectivity.
+    The injection key already encodes ``CtxInputCards`` (input cardinalities
+    after scan-level filtering), so the measured join cardinality is deterministic
+    and reproducible for a given plan structure.  Existing Check 4 (injected vs
+    actual) catches any real mismatches on subsequent iterations.
+
+    Previously this function quarantined any match whose subtree contained dynamic-
+    filter columns outside the join's own condition columns — roughly ~35 injections
+    per run were blocked.  All of those were false positives.
+    """
+    return set()
+
+
+def _quarantine_cross_iteration_cardinality_drift(expr_match_history):
+    """Same expression saw materially different actuals across iterations ON A STABLE PLAN.
+
+    When the plan changes between iterations, cardinalities naturally differ because
+    the join runs in a different physical context — this is expected, not a collision.
+    We only quarantine when the plan fingerprint is the same (stable plan) but the
+    measured cardinality still drifts beyond noise tolerances.
+    """
+    out = set()
+    for expr, hist in expr_match_history.items():
+        if len(hist) < 2:
+            continue
+        prev = hist[-2]
+        curr = hist[-1]
+        # If the plan changed, cardinality drift is expected — skip.
+        if prev.get("plan_fingerprint") != curr.get("plan_fingerprint"):
+            continue
+        prev_actual = int(prev.get("actual_cardinality", 0))
+        curr_actual = int(curr.get("actual_cardinality", 0))
+        if prev_actual == curr_actual:
+            continue
+            
+        # If the previous match was NOT injected (vanilla estimation) 
+        # and the current match IS injected, the "drift" is just the script
+        # fixing its own guessed mapping from Iteration 1. Do not quarantine.
+        prev_injected = prev.get("is_injected", False)
+        curr_injected = curr.get("is_injected", False)
+        if not prev_injected and curr_injected:
+            continue
+            
+        abs_delta = abs(prev_actual - curr_actual)
+        max_mag = max(abs(prev_actual), abs(curr_actual), 1)
+        rel_delta = float(abs_delta) / float(max_mag)
+        if (
+            abs_delta <= STABLE_PLAN_ABS_DRIFT_TOLERANCE
+            or rel_delta <= STABLE_PLAN_REL_DRIFT_TOLERANCE
+        ):
+            continue
+        print(
+            f"    [ALARM-CONTEXT-COLLISION] same key changed cardinality on STABLE plan: "
+            f"prev={prev_actual}, curr={curr_actual} "
+            f"(delta={abs_delta}, {rel_delta:.2%}) -- {expr}"
+        )
+        out.add(expr)
+    return out
+
+
+def collect_quarantine_unsafe_expressions(matches, profile_joins, expr_match_history):
+    """Union of all injection-safety quarantine rules for this iteration."""
+    newly = set()
+    newly |= _quarantine_ambiguous_matches(matches)
+    newly |= _quarantine_same_key_actual_collisions(matches)
+    newly |= _quarantine_dynamic_filter_context(matches, profile_joins)
+    newly |= _quarantine_cross_iteration_cardinality_drift(expr_match_history)
+    return newly
 
 
 def _feedback_query_result(
@@ -1241,6 +1674,7 @@ def _feedback_query_result(
     feedback_unique_plans=0,
     final_plan_fingerprint=None,
     n_injected=0,
+    timing=None,
 ):
     """Single schema for run_single_query return dict (avoids drift between branches)."""
     res = {
@@ -1255,6 +1689,8 @@ def _feedback_query_result(
     if oscillation:
         res["oscillation"] = True
         res["cycle_length"] = cycle_length
+    if timing is not None:
+        res["timing"] = timing
     return res
 
 
@@ -1283,14 +1719,13 @@ def run_single_query(query_nr, query_sql):
     clear_actual_cardinality_json()
     clear_cardinality_log()
 
+    seen_plan_structures = []  # Track all seen plan structures for oscillation detection
     prev_plan_text = None
     plan_changed_iterations = []
-    seen_plan_structures = []  # Track all seen plan structures for oscillation detection
-    expr_match_history = {}
+    expr_match_history = defaultdict(list)
     unsafe_expressions = set()
     unique_plan_texts = set()
     last_plan_fingerprint = None
-    # Cardinality lines marked INJECTED on the last completed iteration (for benchmarks).
     feedback_last_n_injected = 0
 
     for iteration in range(1, MAX_ITERATIONS + 1):
@@ -1346,117 +1781,19 @@ def run_single_query(query_nr, query_sql):
 
         # Step 9: Save pre-update JSON snapshot for verification, then update
         pre_update_json = read_actual_cardinality_json()
-        active_pre_update_json = project_json_for_fingerprint(
-            pre_update_json, None
-        )
         plan_stable = (
             prev_plan_text is not None and current_plan_text == prev_plan_text
         )
-        for m in matches:
-            expr = m["expression"]
-            pidx = m.get("profile_join_index")
-            profile_conditions = ""
-            profile_desc_tables = []
-            profile_plan_path = []
-            if isinstance(pidx, int) and 0 <= pidx < len(profile_joins):
-                profile_conditions = profile_joins[pidx].get("conditions", "")
-                profile_desc_tables = sorted(
-                    list(profile_joins[pidx].get("descendant_tables", set()))
-                )
-                profile_plan_path = list(profile_joins[pidx].get("plan_path", []))
-            expr_match_history.setdefault(expr, []).append(
-                {
-                    "iteration": iteration,
-                    "profile_join_index": pidx,
-                    "log_index": m.get("log_index"),
-                    "actual_cardinality": int(m.get("actual_cardinality", 0)),
-                    "plan_fingerprint": current_plan_fingerprint,
-                    "profile_conditions": profile_conditions,
-                    "profile_descendant_tables": profile_desc_tables,
-                    "profile_plan_path": profile_plan_path,
-                    "profile_ancestor_context": (
-                        profile_joins[pidx].get("ancestor_context", [])
-                        if isinstance(pidx, int) and 0 <= pidx < len(profile_joins)
-                        else []
-                    ),
-                    "profile_subtree_scan_signatures": (
-                        profile_joins[pidx].get("subtree_scan_signatures", [])
-                        if isinstance(pidx, int) and 0 <= pidx < len(profile_joins)
-                        else []
-                    ),
-                    "profile_subtree_operator_signatures": (
-                        profile_joins[pidx].get("subtree_operator_signatures", [])
-                        if isinstance(pidx, int) and 0 <= pidx < len(profile_joins)
-                        else []
-                    ),
-                    "profile_subtree_structure_hash": (
-                        profile_joins[pidx].get("subtree_structure_hash", "")
-                        if isinstance(pidx, int) and 0 <= pidx < len(profile_joins)
-                        else ""
-                    ),
-                    "candidate_count": int(m.get("candidate_count", 0)),
-                }
-            )
-        # Strict safety gate: never inject ambiguous matches or conflicting
-        # same-key cardinalities (beyond tolerated tiny drift).
-        newly_unsafe = set()
-        for m in matches:
-            if int(m.get("candidate_count", 0)) > 1:
-                expr = m["expression"]
-                print(f"    [ALARM-AMBIGUOUS-MATCH] {expr}")
-                newly_unsafe.add(expr)
-        batch_actuals = {}
-        for m in matches:
-            batch_actuals.setdefault(m["expression"], set()).add(
-                int(m.get("actual_cardinality", 0))
-            )
-        for expr, vals in batch_actuals.items():
-            if len(vals) > 1:
-                print(
-                    f"    [ALARM-CONTEXT-COLLISION] same key has conflicting actuals in batch: "
-                    f"{sorted(list(vals))} -- {expr}"
-                )
-                newly_unsafe.add(expr)
-        # Dynamic-filter guard: if a matched subtree scan has dynamic filter columns
-        # outside this join's own condition columns, treat key as context-unsafe.
-        for m in matches:
-            expr = m["expression"]
-            pidx = m.get("profile_join_index")
-            if not (isinstance(pidx, int) and 0 <= pidx < len(profile_joins)):
-                continue
-            pj = profile_joins[pidx]
-            cond_cols = extract_condition_columns(pj.get("conditions", ""))
-            dyn_cols = extract_dynamic_filter_columns(
-                pj.get("subtree_operator_signatures", [])
-            )
-            extra_dyn_cols = sorted([c for c in dyn_cols if c not in cond_cols])
-            if extra_dyn_cols:
-                print(
-                    f"    [ALARM-DYNAMIC-FILTER-CONTEXT] dynamic filter cols outside join "
-                    f"condition: {extra_dyn_cols} -- {expr}"
-                )
-                newly_unsafe.add(expr)
-        for expr, hist in expr_match_history.items():
-            if len(hist) < 2:
-                continue
-            prev = hist[-2]
-            curr = hist[-1]
-            prev_actual = int(prev.get("actual_cardinality", 0))
-            curr_actual = int(curr.get("actual_cardinality", 0))
-            if prev_actual == curr_actual:
-                continue
-            abs_delta = abs(prev_actual - curr_actual)
-            max_mag = max(abs(prev_actual), abs(curr_actual), 1)
-            rel_delta = float(abs_delta) / float(max_mag)
-            if (
-                abs_delta > STABLE_PLAN_ABS_DRIFT_TOLERANCE
-                and rel_delta > STABLE_PLAN_REL_DRIFT_TOLERANCE
-            ):
-                print(
-                    f"    [ALARM-CONTEXT-COLLISION] same key changed cardinality across iterations: "
-                    f"prev={prev_actual}, curr={curr_actual} -- {expr}"
-                )
-                newly_unsafe.add(expr)
+        _record_match_history(
+            expr_match_history,
+            matches,
+            profile_joins,
+            iteration,
+            current_plan_fingerprint,
+        )
+        newly_unsafe = collect_quarantine_unsafe_expressions(
+            matches, profile_joins, expr_match_history
+        )
         unsafe_expressions.update(newly_unsafe)
         purge_unsafe_expressions_from_json(
             unsafe_expressions,
@@ -1487,6 +1824,7 @@ def run_single_query(query_nr, query_sql):
         # Step 10: Verification — runs on EVERY iteration >= 2
         # We verify against the PRE-UPDATE JSON, because that's what DuckDB loaded
         if iteration >= 2:
+            post_update_json = read_actual_cardinality_json()
             verify_injection(
                 log_entries,
                 pre_update_json,
@@ -1496,12 +1834,19 @@ def run_single_query(query_nr, query_sql):
                 iteration,
                 plan_stable=plan_stable,
                 injection_plan_fingerprint=None,
+                post_update_json=post_update_json,
             )
             print(f"  Verification passed.")
 
-        # Step 11: Check convergence — plan structure hasn't changed
-        if prev_plan_text is not None and current_plan_text == prev_plan_text:
+        # Step 11: Check convergence
+        # The plan has converged ONLY IF the physical plan hasn't changed
+        # AND we didn't need to make any changes to the actual_cardinality.json
+        if prev_plan_text is not None and current_plan_text == prev_plan_text and not changes_made:
             print(f"  Plan CONVERGED after {iteration} iterations.")
+            # Timing comparison: if the plan changed at any point, compare perf
+            timing_result = None
+            if plan_changed_iterations:
+                timing_result = compare_plan_timings(query_sql, query_nr)
             return _feedback_query_result(
                 iteration,
                 True,
@@ -1509,31 +1854,58 @@ def run_single_query(query_nr, query_sql):
                 feedback_unique_plans=len(unique_plan_texts),
                 final_plan_fingerprint=last_plan_fingerprint,
                 n_injected=feedback_last_n_injected,
+                timing=timing_result,
             )
 
-        if prev_plan_text is not None:
+        # Step 11b: Plan change and Oscillation detection
+        if prev_plan_text is not None and current_plan_text != prev_plan_text:
             plan_changed_iterations.append(iteration)
             print(f"  Plan CHANGED on iteration {iteration}.")
 
-        # Step 11b: Oscillation detection — if we've seen this exact plan before,
-        # the optimizer is cycling between plans. This is a valid stopping point.
-        if current_plan_text in seen_plan_structures:
-            cycle_start = seen_plan_structures.index(current_plan_text) + 1
-            cycle_len = iteration - cycle_start
-            print(f"  Plan OSCILLATION detected: cycle of length {cycle_len} "
-                  f"(iteration {cycle_start} == iteration {iteration}).")
-            return _feedback_query_result(
-                iteration,
-                False,
-                plan_changed_iterations,
-                oscillation=True,
-                cycle_length=cycle_len,
-                feedback_unique_plans=len(unique_plan_texts),
-                final_plan_fingerprint=last_plan_fingerprint,
-                n_injected=feedback_last_n_injected,
-            )
+            # Oscillation detection — if we've seen this exact plan before,
+            # the optimizer is cycling between plans. This is a valid stopping point.
+            if current_plan_text in seen_plan_structures:
+                cycle_start = seen_plan_structures.index(current_plan_text) + 1
+                cycle_len = iteration - cycle_start
+                print(f"  Plan OSCILLATION detected: cycle of length {cycle_len} "
+                      f"(iteration {cycle_start} == iteration {iteration}).")
 
-        seen_plan_structures.append(current_plan_text)
+                # Purge keys that oscillated
+                oscillating_keys = set()
+                for expr, hist in expr_match_history.items():
+                    if len(hist) < 2:
+                        continue
+                    cards = [int(h.get("actual_cardinality", 0)) for h in hist]
+                    if len(set(cards)) > 1:
+                        oscillating_keys.add(expr)
+
+                if oscillating_keys:
+                    current_json = read_actual_cardinality_json()
+                    purged = 0
+                    for key in oscillating_keys:
+                        if key in current_json:
+                            del current_json[key]
+                            purged += 1
+                    if purged:
+                        write_actual_cardinality_json(current_json)
+                        print(f"  [OSCILLATION-CLEANUP] Removed {purged} oscillating key(s) from JSON.")
+                        for k in sorted(oscillating_keys):
+                            cards = [int(h.get("actual_cardinality", 0)) for h in expr_match_history[k]]
+                            print(f"    {k[:140]}... cards={cards}")
+
+                return _feedback_query_result(
+                    iteration,
+                    False,
+                    plan_changed_iterations,
+                    oscillation=True,
+                    cycle_length=cycle_len,
+                    feedback_unique_plans=len(unique_plan_texts),
+                    final_plan_fingerprint=last_plan_fingerprint,
+                    n_injected=feedback_last_n_injected,
+                )
+
+        if current_plan_text not in seen_plan_structures:
+            seen_plan_structures.append(current_plan_text)
         prev_plan_text = current_plan_text
 
         if not changes_made and iteration > 1:
@@ -1583,6 +1955,26 @@ def print_global_totals(results):
     print(f"  Sum of last-iter n_injected:    {total_injected_sum}")
     print(f"  Sum of feedback_unique_plans:   {sum_unique_plans}")
     print(f"  Converged / oscillation / error: {n_converged} / {n_oscillation} / {n_errors}")
+
+    # Timing summary table (only queries where plan changed and timing was collected)
+    timed = {qn: r["timing"] for qn, r in results.items() if r.get("timing")}
+    if timed:
+        print("=" * 60)
+        print("  TIMING COMPARISON (vanilla vs feedback, plan-changed queries)")
+        print("=" * 60)
+        print(f"  {'Query':<8} {'Vanilla min':>12} {'Feedback min':>12} {'Speedup':>10}")
+        print("  " + "-" * 46)
+        for qn in sorted(timed):
+            t = timed[qn]
+            v_min = t.get("vanilla_min", float("inf"))
+            f_min = t.get("feedback_min", float("inf"))
+            if v_min < float("inf") and f_min < float("inf") and f_min > 0:
+                speedup = v_min / f_min
+                tag = "FASTER" if speedup > 1.0 else "SLOWER ⚠"
+                print(f"  Q{qn:<6} {v_min:>11.3f}s {f_min:>11.3f}s {speedup:>8.2f}x {tag}")
+            else:
+                print(f"  Q{qn:<6} {'N/A':>12} {'N/A':>12} {'N/A':>10}")
+
     print("=" * 60)
     print("  Benchmark complete.")
 

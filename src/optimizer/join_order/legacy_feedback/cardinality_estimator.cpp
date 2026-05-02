@@ -570,10 +570,23 @@ double CardinalityEstimator::EstimateCardinalityWithSet(JoinRelationSet &new_set
 		parent_split_str = "[" + left_split + " | " + right_split + "]";
 	}
 
+	string scan_filter_str = "";
+	for (idx_t i = 0; i < new_set.count; i++) {
+		idx_t rel_idx = new_set.relations[i];
+		auto it = relation_column_info.find(rel_idx);
+		if (it != relation_column_info.end() && !it->second.scan_filter_string.empty()) {
+			if (!scan_filter_str.empty()) scan_filter_str += " | ";
+			scan_filter_str += to_string(rel_idx) + ":" + it->second.scan_filter_string;
+		}
+	}
+
 	string logical_join_core = "LOGICAL_JOIN: RelSets: " + new_set.ToString() + " RelBindings: [" + rel_bindings_str +
 	                           "] NumRels: " + numerator_relset_str + " CtxInputCards: [" + input_cards_str + "]" +
 	                           " CtxParentSplit: " + parent_split_str + " CtxEdgeSig: [" + edge_sig_str + "]" +
 	                           " Filters: [" + filter_str + "]";
+	if (!scan_filter_str.empty()) {
+		logical_join_core += " CtxScanFilters: [" + scan_filter_str + "]";
+	}
 	// Per-run occurrence index disambiguates repeated identical join keys so we only
 	// inject a value back into the exact same key-context position.
 	static unordered_map<string, idx_t> logical_join_occurrence_counter;
@@ -662,6 +675,15 @@ void CardinalityEstimator::InitCardinalityEstimatorProps(optional_ptr<JoinRelati
 
 	// sort relations from greatest tdom to lowest tdom.
 	std::sort(relation_set_stats.begin(), relation_set_stats.end(), SortTdoms);
+
+	// POPULATE RELATION COLUMN INFO
+	D_ASSERT(set->count == 1);
+	idx_t rel_idx = set->relations[0];
+	RelationColumnInfo info;
+	info.table_name = stats.table_name;
+	info.column_names = stats.column_names;
+	info.scan_filter_string = stats.scan_filter_string;
+	relation_column_info[rel_idx] = info;
 }
 
 void CardinalityEstimator::UpdateTotalDomains(optional_ptr<JoinRelationSet> set, RelationStats &stats) {
